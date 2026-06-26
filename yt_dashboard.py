@@ -40,6 +40,12 @@ TIERS = {"small": (0, 100_000), "medium": (100_000, 1_000_000), "large": (1_000_
 # Wallets. Quota resets daily (free). Claude credit is real money.
 WALLET = {"quota": 10_000, "claude_usd": 5.00}
 
+# --- Claude (AI summary) config ---
+CLAUDE_MODEL = "claude-haiku-4-5-20251001"   # cheapest; swap to claude-sonnet-4-6 for deeper analysis
+# ROUGH price estimate in USD per MILLION tokens. VERIFY at anthropic.com/pricing
+# and adjust — this only affects the on-screen cost estimate, not real billing.
+CLAUDE_PRICE = {"input_per_mtok": 1.00, "output_per_mtok": 5.00}
+
 
 # ======================================================================
 # 1. ENGINE
@@ -95,18 +101,30 @@ def parse_duration(iso):
 
 # ---- fetching ----------------------------------------------------------
 def search_ids(keyword, max_results=50, after=None, before=None,
-               order="viewCount", video_duration=None):
-    """One YouTube search. COSTS 100 UNITS. Returns video IDs."""
-    params = {"part": "id", "q": keyword, "type": "video",
-              "order": order, "maxResults": min(max_results, 50)}
+               order="viewCount", video_duration=None, pages=1):
+    """
+    YouTube search. Returns video IDs. COSTS 100 UNITS PER PAGE.
+    pages=1 -> up to 50 IDs (100 units). pages=2 -> up to 100 IDs (200 units), etc.
+    """
+    base = {"part": "id", "q": keyword, "type": "video",
+            "order": order, "maxResults": 50}
     if after:
-        params["publishedAfter"] = f"{after}T00:00:00Z"
+        base["publishedAfter"] = f"{after}T00:00:00Z"
     if before:
-        params["publishedBefore"] = f"{before}T00:00:00Z"
+        base["publishedBefore"] = f"{before}T00:00:00Z"
     if video_duration:
-        params["videoDuration"] = video_duration
-    data = _get("search", params)
-    return [i["id"]["videoId"] for i in data.get("items", [])]
+        base["videoDuration"] = video_duration
+    ids, token = [], None
+    for _ in range(max(1, pages)):
+        params = dict(base)
+        if token:
+            params["pageToken"] = token
+        data = _get("search", params)
+        ids += [i["id"]["videoId"] for i in data.get("items", [])]
+        token = data.get("nextPageToken")
+        if not token:
+            break
+    return ids
 
 
 def get_videos_details(video_ids):
@@ -167,31 +185,37 @@ def enrich(videos, subs_map=None):
 
 
 def fetch_dataset(topic, after=None, before=None, max_results=50,
-                  balanced=True, max_age_days=None, use_cache=True):
+                  balanced=True, max_age_days=None, use_cache=True,
+                  videos_per_format=50):
     """
     Orchestrates a full fetch and returns a Dataset:
       {topic, videos, cost, from_cache}
     'balanced' fetches Shorts AND long-form separately (2 searches).
+    'videos_per_format' = how many videos to pull per format. Each 50 is one
+    search PAGE = 100 units. So 100 videos/format balanced = 4 pages = 400 units.
     Results are cached so an identical call later costs 0.
     """
+    pages = max(1, (videos_per_format + 49) // 50)
     cache = _load_cache()
-    key = json.dumps(["v2", topic, after, before, max_results, balanced, max_age_days])
+    key = json.dumps(["v3", topic, after, before, balanced, max_age_days, pages])
     if use_cache and key in cache:
         return {"topic": topic, "videos": cache[key], "cost": 0, "from_cache": True}
 
     cost = 0
     if balanced:
-        ids = search_ids(topic, max_results, after, before, video_duration="short")
-        ids += search_ids(topic, max_results, after, before, video_duration="medium")
+        ids = search_ids(topic, after=after, before=before,
+                         video_duration="short", pages=pages)
+        ids += search_ids(topic, after=after, before=before,
+                          video_duration="medium", pages=pages)
         ids = list(dict.fromkeys(ids))
-        cost += 200
+        cost += 100 * pages * 2
     else:
-        ids = search_ids(topic, max_results, after, before)
-        cost += 100
+        ids = search_ids(topic, after=after, before=before, pages=pages)
+        cost += 100 * pages
 
     videos = get_videos_details(ids)
     subs_map = get_channel_subs([v["channel_id"] for v in videos])
-    cost += 1 + 1
+    cost += len(range(0, len(ids), 50)) + 1  # cheap detail + subs calls
     enrich(videos, subs_map)
 
     if max_age_days:
@@ -617,6 +641,113 @@ def tool_channels(ds):
 
 
 # ======================================================================
+# AI SUMMARY (Claude) — spends the separate Claude wallet, not quota
+# ======================================================================
+def get_claude_key():
+    """Where the Claude key comes from (Colab secret or .env / env var)."""
+    try:
+        from google.colab import userdata
+        k = userdata.get("ANTHROPIC_API_KEY")
+        if k:
+            return k
+    except Exception:
+        pass
+    k = os.environ.get("ANTHROPIC_API_KEY")
+    if not k:
+        raise RuntimeError("No Claude key. Add ANTHROPIC_API_KEY=... to your .env")
+    return k
+
+
+def _call_claude(prompt, max_tokens=1400):
+    """One call to Claude. Returns {text, usage, cost_usd}."""
+    r = requests.post(
+        "https://api.anthropic.com/v1/messages",
+        headers={"x-api-key": get_claude_key(),
+                 "anthropic-version": "2023-06-01",
+                 "content-type": "application/json"},
+        data=json.dumps({"model": CLAUDE_MODEL, "max_tokens": max_tokens,
+                         "messages": [{"role": "user", "content": prompt}]}))
+    r.raise_for_status()
+    data = r.json()
+    text = "".join(b.get("text", "") for b in data.get("content", [])
+                   if b.get("type") == "text")
+    u = data.get("usage", {})
+    cost = (u.get("input_tokens", 0) / 1e6 * CLAUDE_PRICE["input_per_mtok"]
+            + u.get("output_tokens", 0) / 1e6 * CLAUDE_PRICE["output_per_mtok"])
+    return {"text": text, "usage": u, "cost_usd": round(cost, 4)}
+
+
+def _collect_signals(ds):
+    """Run the free analysis tools and gather their one-line summaries for Claude."""
+    have_cs = bool(ds["videos"]) and "channel_avg_views" in ds["videos"][0]
+    lines = []
+    for key, spec in TOOLS.items():
+        if key == "ai_summary":
+            continue
+        if spec["needs_channel_stats"] and not have_cs:
+            continue
+        try:
+            out = spec["func"](ds)
+            lines.append(f"- {out['name']}: {out['summary']}")
+        except Exception:
+            pass
+    return "\n".join(lines)
+
+
+def tool_ai_summary(ds):
+    """
+    Sends the computed signals to Claude for: a strategy brief, a per-signal read,
+    a blunt reliability verdict, and developer notes (data-accuracy / feature audit).
+    Costs the CLAUDE wallet (a few cents), not YouTube quota.
+    """
+    n = len(ds["videos"])
+    ns = sum(v["is_short"] for v in ds["videos"])
+    signals = _collect_signals(ds)
+    topic = ds.get("topic", "(unknown)")
+
+    prompt = f"""You are a blunt, practical YouTube strategy analyst AND a QA reviewer \
+auditing an automated niche-research tool. Do not flatter. Be concrete.
+
+Topic searched: "{topic}"
+Sample size: {n} videos ({ns} Shorts, {n - ns} long-form).
+Note: "velocity" = views per day. Shorts and long-form are analysed separately.
+
+Computed signals from the tool:
+{signals}
+
+Respond in markdown with EXACTLY these four sections:
+
+## Strategy brief
+2-4 sentences: what kind of content wins in this niche and what the user should make next.
+
+## Per-signal read
+One short line per signal above: what it suggests, and whether it's a real signal or noise.
+
+## Worth following, or noise?
+Be blunt about reliability given the sample size. If comparisons rest on very few \
+videos (e.g. 1 vs 1), say plainly the findings are NOT yet trustworthy and state roughly \
+how many videos would be needed to trust them.
+
+## Developer notes (data accuracy & feature ideas)
+You are auditing the TOOL itself, not just the niche. Flag anything that looks like a \
+data error, a misleading metric, a statistically unsound comparison, or a likely bug. \
+Then suggest 2-3 concrete features or fixes the developer should add. Be specific."""
+
+    try:
+        res = _call_claude(prompt)
+    except Exception as e:
+        return {"name": "AI summary (Claude)", "cost": 0,
+                "summary": f"Claude call failed: {e}",
+                "result": {"text": "", "error": str(e)}}
+
+    out_tok = res["usage"].get("output_tokens", "?")
+    return {"name": "AI summary (Claude)", "cost": 0,
+            "claude_cost_usd": res["cost_usd"], "tokens": res["usage"],
+            "summary": f"AI brief generated — ~${res['cost_usd']:.4f}, {out_tok} output tokens",
+            "result": {"text": res["text"]}}
+
+
+# ======================================================================
 # 4. REGISTRY — the check-mark menu
 #    key -> {label, category, func, cost_note}
 # ======================================================================
@@ -671,6 +802,8 @@ TOOLS = {
     "channels":    {"label": "Channels in niche (avg views + consistency)",
                     "cat": "Channel",
                     "func": tool_channels, "needs_channel_stats": False},
+    "ai_summary":  {"label": "AI summary (Claude) — costs credit", "cat": "AI",
+                    "func": tool_ai_summary, "needs_channel_stats": False},
 }
 
 
