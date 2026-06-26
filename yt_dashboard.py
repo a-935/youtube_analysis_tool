@@ -590,6 +590,56 @@ def tool_cadence(ds):
             "summary": summary, "result": {"channels": ranked}}
 
 
+def _humanize(n):
+    n = float(n)
+    if n >= 1e6:
+        return f"{n / 1e6:.1f}M"
+    if n >= 1e3:
+        return f"{n / 1e3:.0f}K"
+    return f"{int(n)}"
+
+
+def _histogram(values, bins=10, unit=""):
+    """Bin values into a labelled histogram for charting."""
+    values = [v for v in values if v is not None]
+    if not values:
+        return {"labels": [], "counts": []}
+    lo, hi = min(values), max(values)
+    if hi == lo:
+        hi = lo + 1
+    width = (hi - lo) / bins
+    counts = [0] * bins
+    for v in values:
+        idx = min(int((v - lo) / width), bins - 1)
+        counts[idx] += 1
+    labels = [f"{_humanize(lo + i * width)}-{_humanize(lo + (i + 1) * width)}{unit}"
+              for i in range(bins)]
+    return {"labels": labels, "counts": counts}
+
+
+def tool_charts(ds):
+    """
+    Distribution charts per format: duration histogram, views-per-day histogram,
+    and a views-vs-like-rate scatter (to see if like% just tracks reach).
+    Pure math on already-fetched data — no API cost.
+    """
+    result = {}
+    for name, grp in zip(("shorts", "long"), by_format(ds["videos"])):
+        result[name] = {
+            "duration_hist": _histogram([v["duration_sec"] for v in grp], unit="s"),
+            "vpd_hist": _histogram([v["views_per_day"] for v in grp
+                                    if v["views_per_day"] > 0]),
+            "scatter": [{"views": v["views"],
+                         "like_rate_pct": round(v["like_rate"] * 100, 2)}
+                        for v in grp if v["views"] > 0],
+            "n": len(grp),
+        }
+    summary = ("Distributions per format: video length, views-per-day, and "
+               "views-vs-like-rate (shows whether like% just falls as views rise).")
+    return {"name": "Distribution charts", "cost": 0,
+            "summary": summary, "result": result}
+
+
 def tool_channels(ds):
     """
     For the channels in THIS search, show each channel's average views,
@@ -603,20 +653,28 @@ def tool_channels(ds):
         rows = []
         for chan, cvids in by_chan.items():
             views = [v["views"] for v in cvids]
-            avg = statistics.mean(views)
-            # The videos that beat this channel's own average — titles + links.
-            # This is the list the GUI will reveal when you click the ">avg" cell.
-            above = sorted([v for v in cvids if v["views"] > avg],
+            n = len(cvids)
+            # median is robust; for n==1 it's just that video (we label it honestly)
+            typical = round(statistics.median(views))
+            # "beats typical" only meaningful with enough videos
+            above = sorted([v for v in cvids if v["views"] > statistics.median(views)],
                            key=lambda v: -v["views"])
             above_videos = [{
                 "title": v["title"],
                 "url": v.get("url", f"https://www.youtube.com/watch?v={v['id']}"),
                 "views": v["views"],
             } for v in above]
-            rows.append({"channel": chan, "n": len(cvids), "avg_views": round(avg),
+            rows.append({"channel": chan, "n": n, "typical_views": typical,
+                         "single_video": n == 1,
                          "above_count": len(above_videos),
-                         "above_videos": above_videos})
-        rows.sort(key=lambda r: -r["avg_views"])
+                         "above_videos": above_videos,
+                         "all_videos": [{
+                             "title": v["title"],
+                             "url": v.get("url", f"https://www.youtube.com/watch?v={v['id']}"),
+                             "views": v["views"]} for v in
+                             sorted(cvids, key=lambda v: -v["views"])]})
+        # Rank by typical views, but multi-video channels first (more trustworthy)
+        rows.sort(key=lambda r: (r["n"] >= 3, r["typical_views"]), reverse=True)
         return rows
 
     res = per_format(ds["videos"], grp)
@@ -627,16 +685,24 @@ def tool_channels(ds):
         if not rows:
             continue
         detail.append(f"    {fmt_name}:")
-        detail.append(f"    {'channel':22} {'vids':>4} {'avg views':>12} {'>avg':>5}")
+        detail.append(f"    {'channel':22} {'vids':>4} {'median views':>13}")
         for r in rows[:10]:
+            tag = " (1 video)" if r["single_video"] else ""
             detail.append(f"    {r['channel'][:22]:22} {r['n']:>4} "
-                          f"{r['avg_views']:>12,} {r['above_count']:>5}")
+                          f"{r['typical_views']:>13,}{tag}")
 
-    top = res["shorts"][0] if res["shorts"] else (res["long"][0] if res["long"] else None)
-    summary = (f"Top niche channel (Shorts): {top['channel']} — "
-               f"avg {top['avg_views']:,} over {top['n']} videos"
-               if top else "No channels found")
-    return {"name": "Channels in niche (avg views)", "cost": 0,
+    # Prefer a channel with several videos for the headline (more meaningful)
+    def best(rows):
+        multi = [r for r in rows if r["n"] >= 3]
+        return (multi or rows)[0] if rows else None
+    top = best(res["shorts"]) or best(res["long"])
+    if top:
+        kind = f"{top['n']} videos" if not top["single_video"] else "1 video (single data point)"
+        summary = (f"Top niche channel (Shorts): {top['channel']} — "
+                   f"median {top['typical_views']:,} across {kind}")
+    else:
+        summary = "No channels found"
+    return {"name": "Channels in niche (median views)", "cost": 0,
             "summary": summary, "detail": detail, "result": res}
 
 
@@ -804,6 +870,8 @@ TOOLS = {
                     "func": tool_channels, "needs_channel_stats": False},
     "ai_summary":  {"label": "AI summary (Claude) — costs credit", "cat": "AI",
                     "func": tool_ai_summary, "needs_channel_stats": False},
+    "charts":      {"label": "Distribution charts", "cat": "Visual",
+                    "func": tool_charts, "needs_channel_stats": False},
 }
 
 

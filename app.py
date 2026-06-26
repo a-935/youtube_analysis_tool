@@ -30,6 +30,11 @@ _load_env()
 import streamlit as st
 import yt_dashboard as engine
 
+try:
+    import pandas as pd
+except Exception:
+    pd = None
+
 st.set_page_config(page_title="Niche Research", layout="wide")
 
 for k, default in [("quota_used", 0), ("claude_used", 0.0),
@@ -234,7 +239,31 @@ for key, out in R["outputs"]:
         st.caption(out["summary"])
         result = out["result"]
 
-        if key == "ai_summary":
+        if key == "charts":
+            if pd is None:
+                st.info("pandas not available for charts.")
+            for fmt in ("shorts", "long"):
+                block = result.get(fmt, {})
+                if not block.get("n"):
+                    continue
+                st.markdown(f"**{fmt.title()}** ({block['n']} videos)")
+
+                dh = block["duration_hist"]
+                if dh["labels"]:
+                    st.caption("Video length distribution (seconds) — where the lengths cluster")
+                    st.bar_chart(pd.DataFrame({"videos": dh["counts"]}, index=dh["labels"]))
+
+                vh = block["vpd_hist"]
+                if vh["labels"]:
+                    st.caption("Views-per-day distribution — where most videos land, and the outlier tail")
+                    st.bar_chart(pd.DataFrame({"videos": vh["counts"]}, index=vh["labels"]))
+
+                if block["scatter"]:
+                    st.caption("Views vs like-rate — if dots slope down, low like% just tracks high views")
+                    st.scatter_chart(pd.DataFrame(block["scatter"]),
+                                     x="views", y="like_rate_pct")
+
+        elif key == "ai_summary":
             if result.get("text"):
                 st.markdown(result["text"])
             else:
@@ -262,12 +291,20 @@ for key, out in R["outputs"]:
                     continue
                 st.markdown(f"**{fmt.title()}**")
                 for r in rows[:12]:
-                    low = " . (low sample)" if r["n"] < 3 else ""
-                    head = (f"{r['channel']} - avg {r['avg_views']:,} over "
-                            f"{r['n']} videos . {r['above_count']} beat avg{low}")
-                    with st.expander(head):
-                        for v in r["above_videos"]:
-                            st.markdown(f"- [{v['title']}]({v['url']}) - {fmt_views(v['views'])} views")
+                    if r["single_video"]:
+                        head = (f"{r['channel']} - 1 video here: "
+                                f"{fmt_views(r['typical_views'])} views (single data point)")
+                        with st.expander(head):
+                            for v in r["all_videos"]:
+                                st.markdown(f"- [{v['title']}]({v['url']}) - "
+                                            f"{fmt_views(v['views'])} views")
+                    else:
+                        head = (f"{r['channel']} - median {r['typical_views']:,} over "
+                                f"{r['n']} videos . {r['above_count']} above their median")
+                        with st.expander(head):
+                            for v in r["above_videos"]:
+                                st.markdown(f"- [{v['title']}]({v['url']}) - "
+                                            f"{fmt_views(v['views'])} views")
 
         elif key == "breakouts":
             for fmt in ("shorts", "long"):
