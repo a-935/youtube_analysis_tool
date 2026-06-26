@@ -174,7 +174,7 @@ def enrich(videos, subs_map=None):
         v["age_days"] = age
         v["views_per_day"] = round(v["views"] / age, 1)
         v["like_rate"] = round(v["likes"] / v["views"], 4) if v["views"] else 0
-        v["comment_rate"] = round(v["comments"] / v["views"], 4) if v["views"] else 0
+        v["comment_rate"] = round(v["comments"] / v["views"], 5) if v["views"] else 0
         wd = pub.weekday()       # 0 = Monday
         v["weekday"] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"][wd]
         v["hour"] = pub.hour
@@ -252,7 +252,10 @@ def fetch_channel_stats(dataset):
             details = get_videos_details(vids)
             cost += 3
             views = [d["views"] for d in details if d["views"] > 0]
-            avg_views = statistics.mean(views) if views else 0
+            # median, not mean: a channel's own viral hit drags the mean up and makes
+            # every other video look like an "underperformer" (same lesson as bugs #4/#5,
+            # which never reached this function).
+            avg_views = statistics.median(views) if views else 0
             # cadence: spread of publish dates -> uploads & views per month
             dates = sorted(datetime.fromisoformat(d["published"].replace("Z", "+00:00"))
                            for d in details)
@@ -388,16 +391,20 @@ def _verdict(top, bottom):
 
 
 def _vid_card(v, baseline=None):
-    """A compact, link-ready dict for one video, with context numbers attached."""
+    """A compact, link-ready dict for one video, with context numbers attached.
+    Also carries the RAW numbers behind each multiplier (niche baseline, channel
+    median, channel name) so the GUI can reveal them on hover."""
     card = {
         "title": v["title"], "url": v.get("url", f"https://www.youtube.com/watch?v={v['id']}"),
         "views": v["views"], "views_per_day": v.get("views_per_day"),
-        "age_days": v.get("age_days"),
+        "age_days": v.get("age_days"), "channel": v.get("channel"),
     }
     if baseline:
+        card["baseline"] = round(baseline)
         card["vs_baseline"] = round(v.get("views_per_day", 0) / baseline, 2) if baseline else None
     avg = v.get("channel_avg_views")
     if avg:
+        card["channel_avg_views"] = round(avg)
         card["vs_channel_avg"] = round(v["views"] / avg, 2) if avg else None
     return card
 
@@ -451,15 +458,17 @@ def _presence_tool(name, pred):
     return tool
 
 
-def _numeric_tool(name, fn, unit=""):
-    """Factory: median of a numeric trait in fastest vs slowest, with per-video values."""
+def _numeric_tool(name, fn, unit="", decimals=1):
+    """Factory: median of a numeric trait in fastest vs slowest, with per-video values.
+    'decimals' controls display precision — comment-rate needs more than 1 dp or it
+    rounds to a useless 0.0% for every video."""
     def tool(ds):
         def grp(vids):
             top, bot = top_bottom(vids)
             def items(vs):
                 return [{"title": v["title"],
                          "url": v.get("url", f"https://www.youtube.com/watch?v={v['id']}"),
-                         "views": v["views"], "value": round(fn(v), 1)}
+                         "views": v["views"], "value": round(fn(v), decimals)}
                         for v in vs]
             return {"top": _med(top, fn), "bottom": _med(bot, fn),
                     "top_n": len(top), "bottom_n": len(bot),
@@ -467,23 +476,41 @@ def _numeric_tool(name, fn, unit=""):
         res = per_format(ds["videos"], grp)
         s = res["shorts"]
         verdict = _verdict(s["top"], s["bottom"])
-        summary = (f"Shorts: {verdict} — fastest {s['top']:.1f}{unit} vs "
-                   f"slowest {s['bottom']:.1f}{unit} "
+        summary = (f"Shorts: {verdict} — fastest {s['top']:.{decimals}f}{unit} vs "
+                   f"slowest {s['bottom']:.{decimals}f}{unit} "
                    f"(based on {s['top_n']}+{s['bottom_n']} videos)")
         return {"name": name, "cost": 0, "summary": summary, "result": res}
     return tool
 
 
+# words that are never an interesting "hook" (pure glue) — plus the topic itself,
+# stripped per-search so we don't "discover" that meccha-chameleon videos open with
+# the word "meccha".
+_HOOK_STOP = {"the", "a", "an", "is", "of", "to", "in", "on", "my", "with", "for"}
+
+
 def tool_title_hook(ds):
-    """Most common opening words among top performers."""
+    """Most common MEANINGFUL opening word among top performers (topic + glue words
+    skipped, so the opener is actually informative rather than just the search term)."""
+    topic_words = set(re.findall(r"\w+", ds.get("topic", "").lower()))
+    skip = topic_words | _HOOK_STOP
+
+    def first_real_word(title):
+        for raw in title.lower().split():
+            w = re.sub(r"[^\w']", "", raw)        # strip punctuation/emoji/hashes
+            if w and w not in skip:
+                return w
+        return None
+
     def grp(vids):
         top, _ = top_bottom(vids)
-        firsts = [v["title"].split()[0].lower() for v in top if v["title"].split()]
+        firsts = [w for w in (first_real_word(v["title"]) for v in top) if w]
         return {"common_openers": Counter(firsts).most_common(5),
-                "top_videos": top, "n": len(top)}
+                "top_videos": top, "n": len(top), "counted": len(firsts)}
     res = per_format(ds["videos"], grp)
     s = res["shorts"]["common_openers"][:3]
-    summary = "Top Shorts often open with: " + ", ".join(f"'{w}'" for w, _ in s)
+    summary = ("Top Shorts often open with: " + ", ".join(f"'{w}'" for w, _ in s)
+               if s else "No clear opening-word pattern")
     return {"name": "Title hook (opening words)", "cost": 0,
             "summary": summary, "result": res}
 
@@ -561,10 +588,17 @@ def tool_channel_outlier(ds):
                       key=lambda v: -v["vs_own_channel"])
         under = sorted([v for v in vids if 0 < v["vs_own_channel"] <= 0.7],
                        key=lambda v: v["vs_own_channel"])
-        return {"overperformed": over[:8], "underperformed": under[:8], "n": len(vids)}
+        rated = [v for v in vids if v["vs_own_channel"] > 0]
+        # NOTE: over[:8]/under[:8] are trimmed for DISPLAY only. The *_count fields are
+        # the real totals. The old summary counted the trimmed list, so it always said
+        # "8" — which is what made the AI "discover" a fake 98%-underperform crisis.
+        return {"overperformed": over[:8], "underperformed": under[:8],
+                "over_count": len(over), "under_count": len(under),
+                "rated_count": len(rated), "n": len(vids)}
     res = per_format(ds["videos"], grp)
-    summary = (f"Shorts beating their own channel avg: "
-               f"{len(res['shorts']['overperformed'])}")
+    s = res["shorts"]
+    summary = (f"Shorts beating their own channel median (≥1.5×): "
+               f"{s.get('over_count', 0)} of {s.get('rated_count', 0)} rated")
     return {"name": "Per-channel over/under", "cost": 0,
             "summary": summary, "result": res}
 
@@ -919,7 +953,8 @@ TOOLS = {
                     "needs_channel_stats": False},
     "comment_rate": {"label": "Comment-per-view rate", "cat": "Engagement",
                      "func": _numeric_tool("Comment rate",
-                                           lambda v: v["comment_rate"] * 100, "%"),
+                                           lambda v: v["comment_rate"] * 100, "%",
+                                           decimals=3),
                      "needs_channel_stats": False},
     "breakouts":   {"label": "Small-channel breakouts", "cat": "Channel",
                     "func": tool_small_breakouts, "needs_channel_stats": False},

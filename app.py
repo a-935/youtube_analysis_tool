@@ -11,6 +11,7 @@ RUN:  streamlit run app.py
 """
 
 import os
+import html
 from datetime import date
 
 
@@ -79,15 +80,58 @@ def pattern_table(cards, value_header):
 
 
 def outlier_table(cards):
-    def chan(c):
-        v = c.get("vs_channel_avg")
-        return f"{v}×" if v is not None else "—"
-    cols = [("Video", _title_cell),
-            ("Views", lambda c: fmt_views(c["views"])),
-            ("× niche median", lambda c: f"{c.get('vs_baseline', '—')}×"),
-            ("× channel avg", chan),
-            ("Age", lambda c: f"{c.get('age_days', '—')}d")]
-    return md_table(cards, cols)
+    """HTML table whose × multipliers reveal the raw numbers on hover:
+    × niche median  -> this video's views/day vs the niche median
+    × channel avg   -> channel name + this video vs the channel's typical (median) views
+    Rendered with unsafe_allow_html=True."""
+    if not cards:
+        return ""
+
+    def tip(text, tip_text):
+        return f'<span title="{html.escape(tip_text, quote=True)}">{text}</span>'
+
+    rows = []
+    for c in cards:
+        title = html.escape(str(c.get("title", "")))
+        url = html.escape(c.get("url", ""), quote=True)
+
+        vsb, base, vpd = c.get("vs_baseline"), c.get("baseline"), c.get("views_per_day")
+        if vsb is not None and base:
+            niche = tip(f"{vsb}×",
+                        f"{(vpd or 0):,.0f} views/day  ÷  niche median {base:,} views/day  =  {vsb}×")
+        else:
+            niche = "—"
+
+        vca, avg, chan = c.get("vs_channel_avg"), c.get("channel_avg_views"), c.get("channel")
+        if vca is not None and avg:
+            chan_label = html.escape(str(chan or "this channel"))
+            niche_chan = tip(f"{vca}×",
+                             f"{chan_label} — this video {c.get('views', 0):,} views  vs  "
+                             f"channel typical {avg:,} views (recent uploads)  =  {vca}×")
+        else:
+            niche_chan = "—"
+
+        rows.append(
+            "<tr>"
+            f"<td style='padding:4px 8px'><a href='{url}' target='_blank'>{title}</a></td>"
+            f"<td style='padding:4px 8px;text-align:right'>{c.get('views', 0):,}</td>"
+            f"<td style='padding:4px 8px;text-align:right'>{niche}</td>"
+            f"<td style='padding:4px 8px;text-align:right'>{niche_chan}</td>"
+            f"<td style='padding:4px 8px;text-align:right'>{c.get('age_days', '—')}d</td>"
+            "</tr>"
+        )
+
+    header = (
+        "<table style='width:100%;border-collapse:collapse;font-size:0.9em'>"
+        "<thead><tr style='border-bottom:1px solid #ccc'>"
+        "<th style='padding:4px 8px;text-align:left'>Video</th>"
+        "<th style='padding:4px 8px;text-align:right'>Views</th>"
+        "<th style='padding:4px 8px;text-align:right'>× niche median</th>"
+        "<th style='padding:4px 8px;text-align:right'>× channel avg</th>"
+        "<th style='padding:4px 8px;text-align:right'>Age</th>"
+        "</tr></thead><tbody>"
+    )
+    return header + "".join(rows) + "</tbody></table>"
 
 
 # ---------------- SIDEBAR ----------------
@@ -350,11 +394,11 @@ for key, out in R["outputs"]:
                             f"(the reference all multipliers compare to)")
                 if b.get("fastest"):
                     st.markdown("Fastest (2×+ the median):")
-                    st.markdown(outlier_table(b["fastest"][:8]))
+                    st.markdown(outlier_table(b["fastest"][:8]), unsafe_allow_html=True)
                 if b.get("slowest"):
                     st.markdown("Slowest (below 0.5× median) — a 'slow' video may still "
                                 "beat its own channel (see × channel avg):")
-                    st.markdown(outlier_table(b["slowest"][:8]))
+                    st.markdown(outlier_table(b["slowest"][:8]), unsafe_allow_html=True)
 
         elif key == "channels":
             for fmt in ("shorts", "long"):
