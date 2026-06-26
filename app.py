@@ -47,19 +47,47 @@ def fmt_views(n):
     return f"{n:,}" if isinstance(n, int) else "-"
 
 
-def vid_line(card):
-    bits = []
-    if card.get("value") is not None:
-        bits.append(f"**{card['value']}**")
-    if card.get("views") is not None:
-        bits.append(f"{fmt_views(card['views'])} views")
-    if card.get("vs_baseline") is not None:
-        bits.append(f"{card['vs_baseline']}x the niche median velocity")
-    if card.get("vs_channel_avg") is not None:
-        bits.append(f"{card['vs_channel_avg']}x its own channel avg")
-    if card.get("age_days") is not None:
-        bits.append(f"{card['age_days']}d old")
-    st.markdown(f"- [{card['title']}]({card['url']}) - " + " . ".join(bits))
+def _title_cell(c):
+    # escape pipes/newlines so titles don't break the markdown table
+    t = str(c["title"]).replace("|", "\\|").replace("\n", " ").strip()
+    return f"[{t}]({c['url']})"
+
+
+def md_table(cards, cols):
+    """Build a markdown table. cols = list of (header, fn(card)->str)."""
+    if not cards:
+        return ""
+    head = "| " + " | ".join(h for h, _ in cols) + " |"
+    sep = "| " + " | ".join("---" for _ in cols) + " |"
+    rows = ["| " + " | ".join(fn(c) for _, fn in cols) + " |" for c in cards]
+    return "\n".join([head, sep] + rows)
+
+
+# value-column header per pattern tool
+VALUE_LABEL = {
+    "title_len": "Chars", "emoji": "Emoji?", "question": "Question?",
+    "numbers": "Number/$?", "caps": "ALL-CAPS", "duration": "Seconds",
+    "like_rate": "Like %", "comment_rate": "Comment %",
+}
+
+
+def pattern_table(cards, value_header):
+    cols = [("Video", _title_cell),
+            (value_header, lambda c: str(c.get("value", ""))),
+            ("Views", lambda c: fmt_views(c["views"]))]
+    return md_table(cards, cols)
+
+
+def outlier_table(cards):
+    def chan(c):
+        v = c.get("vs_channel_avg")
+        return f"{v}×" if v is not None else "—"
+    cols = [("Video", _title_cell),
+            ("Views", lambda c: fmt_views(c["views"])),
+            ("× niche median", lambda c: f"{c.get('vs_baseline', '—')}×"),
+            ("× channel avg", chan),
+            ("Age", lambda c: f"{c.get('age_days', '—')}d")]
+    return md_table(cards, cols)
 
 
 # ---------------- SIDEBAR ----------------
@@ -104,6 +132,17 @@ st.sidebar.caption(f"Est. fetch cost: ~{est_units} quota units "
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("Tools to run")
+
+# Select all / Clear all. (Select all skips the paid AI tool so you don't
+# spend Claude credit by accident — tick that one yourself.)
+sa, ca = st.sidebar.columns(2)
+if sa.button("Select all", use_container_width=True):
+    for k in engine.TOOLS:
+        st.session_state[f"chk_{k}"] = (k != "ai_summary")
+if ca.button("Clear all", use_container_width=True):
+    for k in engine.TOOLS:
+        st.session_state[f"chk_{k}"] = False
+st.sidebar.caption("'Select all' skips the paid AI summary — tick it yourself.")
 
 TOOL_HELP = {
     "outliers": "Ranks videos by views-per-day vs the niche median. Shows fastest/slowest per format.",
@@ -255,19 +294,17 @@ if n < 20:
                f"Raise 'Videos per format', widen the From date, or set Channel size to 'all'.")
 
 
-def render_pattern(result):
+def render_pattern(result, value_header):
     for fmt in ("shorts", "long"):
         block = result.get(fmt, {})
         top, bot = block.get("top_items", []), block.get("bottom_items", [])
         if not top and not bot:
             continue
-        st.markdown(f"**{fmt.title()}** - faster videos")
-        for c in top[:6]:
-            vid_line(c)
+        st.markdown(f"**{fmt.title()}** — faster videos")
+        st.markdown(pattern_table(top[:6], value_header))
         if bot:
-            st.markdown(f"**{fmt.title()}** - slower videos")
-            for c in bot[:6]:
-                vid_line(c)
+            st.markdown(f"**{fmt.title()}** — slower videos")
+            st.markdown(pattern_table(bot[:6], value_header))
 
 
 for key, out in R["outputs"]:
@@ -309,17 +346,15 @@ for key, out in R["outputs"]:
         elif key == "outliers":
             for fmt in ("shorts", "long"):
                 b = result.get(fmt, {})
-                st.markdown(f"**{fmt.title()}** - median {b.get('baseline', 0):,} views/day "
-                            f"(this is the reference all multipliers below compare to)")
+                st.markdown(f"**{fmt.title()}** — median {b.get('baseline', 0):,} views/day "
+                            f"(the reference all multipliers compare to)")
                 if b.get("fastest"):
-                    st.markdown("Fastest (2x+ the median views/day):")
-                    for c in b["fastest"][:8]:
-                        vid_line(c)
+                    st.markdown("Fastest (2×+ the median):")
+                    st.markdown(outlier_table(b["fastest"][:8]))
                 if b.get("slowest"):
-                    st.markdown("Slowest (below 0.5x the median views/day) - "
-                                "check the channel-avg column, a 'slow' video may still beat its channel:")
-                    for c in b["slowest"][:8]:
-                        vid_line(c)
+                    st.markdown("Slowest (below 0.5× median) — a 'slow' video may still "
+                                "beat its own channel (see × channel avg):")
+                    st.markdown(outlier_table(b["slowest"][:8]))
 
         elif key == "channels":
             for fmt in ("shorts", "long"):
@@ -327,34 +362,33 @@ for key, out in R["outputs"]:
                 if not rows:
                     continue
                 st.markdown(f"**{fmt.title()}**")
+                vcols = [("Video", _title_cell),
+                         ("Views", lambda c: fmt_views(c["views"]))]
                 for r in rows[:12]:
                     if r["single_video"]:
-                        head = (f"{r['channel']} - 1 video here: "
+                        head = (f"{r['channel']} — 1 video here: "
                                 f"{fmt_views(r['typical_views'])} views (single data point)")
                         with st.expander(head):
-                            for v in r["all_videos"]:
-                                st.markdown(f"- [{v['title']}]({v['url']}) - "
-                                            f"{fmt_views(v['views'])} views")
+                            st.markdown(md_table(r["all_videos"], vcols))
                     else:
-                        head = (f"{r['channel']} - median {r['typical_views']:,} over "
+                        head = (f"{r['channel']} — median {r['typical_views']:,} over "
                                 f"{r['n']} videos . {r['above_count']} above their median")
                         with st.expander(head):
-                            for v in r["above_videos"]:
-                                st.markdown(f"- [{v['title']}]({v['url']}) - "
-                                            f"{fmt_views(v['views'])} views")
+                            st.markdown(md_table(r["above_videos"], vcols))
 
         elif key == "breakouts":
             for fmt in ("shorts", "long"):
                 vids = result.get(fmt, {}).get("top", [])
                 if vids:
                     st.markdown(f"**{fmt.title()}**")
-                    for v in vids[:8]:
-                        st.markdown(f"- [{v['title']}]({v['url']}) - "
-                                    f"{v['views_per_sub']}x its subscriber count, {fmt_views(v['views'])} views")
+                    cols = [("Video", _title_cell),
+                            ("× subs", lambda c: f"{c['views_per_sub']}×"),
+                            ("Views", lambda c: fmt_views(c["views"]))]
+                    st.markdown(md_table(vids[:8], cols))
 
         elif key in ("title_len", "emoji", "question", "numbers", "caps",
                      "duration", "like_rate", "comment_rate"):
-            render_pattern(result)
+            render_pattern(result, VALUE_LABEL.get(key, "Value"))
 
         else:
             links = engine.linkable_titles(result)
