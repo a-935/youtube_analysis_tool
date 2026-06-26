@@ -187,6 +187,11 @@ if run:
             out = engine.TOOLS[k]["func"](ds)
         outputs.append((k, out))
 
+    # Render order: everything else first, charts next-to-last, AI summary last,
+    # so you read visuals then Claude's interpretation of them.
+    rank = {"charts": 1, "ai_summary": 2}
+    outputs.sort(key=lambda ko: rank.get(ko[0], 0))
+
     st.session_state.results = {
         "topic": topic,
         "ds_meta": {"n": len(ds["videos"]),
@@ -198,6 +203,38 @@ if run:
 
 # ---------------- HEADER + WALLET ----------------
 st.title("YouTube Niche Research")
+
+with st.expander("📖 How to read this (plain-language guide)"):
+    st.markdown("""
+**Velocity (views/day)** — how *fast* a video gathers views, not its total.
+A video with 1,000 views in 2 days (500/day) is hotter right now than one with
+5,000 views over 100 days (50/day). We rank by this so today's trends rise to the top.
+
+**Niche median** — the *typical* video in your search. Everything is compared to it.
+"2× niche median" means twice as fast as the typical video here.
+
+**× channel avg** — how much a video beat *its own channel's* normal. A video can be
+slow for the whole niche but still 6× its own channel — that means the idea worked
+*for them*, even if the niche is bigger.
+
+**Shorts vs long-form** — always analysed separately. Shorts gather views much faster,
+so mixing them would make Shorts always "win" unfairly.
+
+**Faster vs slower videos** — for each pattern (emoji, length, etc.) we compare the
+top third of videos against the bottom third, to see what the winners do differently.
+
+**"No clear difference"** — the top and bottom groups are basically the same on that
+trait, so it's *not* what separates hits from flops here. Useful to know what *doesn't*
+matter.
+
+**Small-channel breakout (× subs)** — views divided by subscribers. 100× subs means a
+video got 100 times the channel's subscriber count in views — a sign the *idea* carried
+it, not the existing audience.
+
+⚠️ **Sample size matters.** With few videos, small differences are just luck. Trust
+patterns more when each group has 30+ videos, and treat single-video findings as hints,
+not facts.
+""")
 
 m1, m2 = st.columns(2)
 m1.metric("Quota used (this session)", f"{st.session_state.quota_used:,} units")

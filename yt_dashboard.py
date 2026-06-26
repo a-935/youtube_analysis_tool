@@ -599,21 +599,44 @@ def _humanize(n):
     return f"{int(n)}"
 
 
-def _histogram(values, bins=10, unit=""):
-    """Bin values into a labelled histogram for charting."""
-    values = [v for v in values if v is not None]
+def _histogram(values, bins=10, mode="linear", fmt=None):
+    """
+    Bin values into a labelled histogram.
+    mode='log' spreads right-skewed data (like views/day) so it isn't one tall bar.
+    fmt formats the edge labels (e.g. seconds for duration, humanized for views).
+    """
+    if fmt is None:
+        fmt = _humanize
+    if mode == "log":
+        values = [v for v in values if v and v > 0]
+    else:
+        values = [v for v in values if v is not None]
     if not values:
         return {"labels": [], "counts": []}
-    lo, hi = min(values), max(values)
-    if hi == lo:
-        hi = lo + 1
-    width = (hi - lo) / bins
+
+    if mode == "log":
+        import math
+        lo = max(min(values), 1)
+        hi = max(values)
+        if hi <= lo:
+            hi = lo * 10
+        llo, lhi = math.log10(lo), math.log10(hi)
+        edges = [10 ** (llo + (lhi - llo) * i / bins) for i in range(bins + 1)]
+    else:
+        lo, hi = min(values), max(values)
+        if hi == lo:
+            hi = lo + 1
+        edges = [lo + (hi - lo) * i / bins for i in range(bins + 1)]
+
     counts = [0] * bins
     for v in values:
-        idx = min(int((v - lo) / width), bins - 1)
+        idx = bins - 1
+        for i in range(bins):
+            if v <= edges[i + 1]:
+                idx = i
+                break
         counts[idx] += 1
-    labels = [f"{_humanize(lo + i * width)}-{_humanize(lo + (i + 1) * width)}{unit}"
-              for i in range(bins)]
+    labels = [f"{fmt(edges[i])}-{fmt(edges[i + 1])}" for i in range(bins)]
     return {"labels": labels, "counts": counts}
 
 
@@ -626,9 +649,10 @@ def tool_charts(ds):
     result = {}
     for name, grp in zip(("shorts", "long"), by_format(ds["videos"])):
         result[name] = {
-            "duration_hist": _histogram([v["duration_sec"] for v in grp], unit="s"),
+            "duration_hist": _histogram([v["duration_sec"] for v in grp],
+                                        fmt=lambda x: f"{int(x)}s"),
             "vpd_hist": _histogram([v["views_per_day"] for v in grp
-                                    if v["views_per_day"] > 0]),
+                                    if v["views_per_day"] > 0], mode="log"),
             "scatter": [{"views": v["views"],
                          "like_rate_pct": round(v["like_rate"] * 100, 2)}
                         for v in grp if v["views"] > 0],
@@ -760,6 +784,44 @@ def _collect_signals(ds):
     return "\n".join(lines)
 
 
+def _corr(xs, ys):
+    """Pearson correlation; returns 0 if undefined."""
+    n = len(xs)
+    if n < 3:
+        return 0
+    mx, my = sum(xs) / n, sum(ys) / n
+    num = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
+    dx = sum((x - mx) ** 2 for x in xs) ** 0.5
+    dy = sum((y - my) ** 2 for y in ys) ** 0.5
+    return round(num / (dx * dy), 2) if dx and dy else 0
+
+
+def _distribution_summary(ds):
+    """Plain-text description of the distributions, so Claude can 'see' the charts."""
+    lines = []
+    for name, grp in zip(("Shorts", "Long-form"), by_format(ds["videos"])):
+        if len(grp) < 5:
+            continue
+        durs = sorted(v["duration_sec"] for v in grp)
+        vpd = sorted(v["views_per_day"] for v in grp if v["views_per_day"] > 0)
+        views = [v["views"] for v in grp if v["views"] > 0]
+        likes = [v["like_rate"] * 100 for v in grp if v["views"] > 0]
+        r = _corr(views, likes)
+        med_d = durs[len(durs) // 2]
+        med_v = vpd[len(vpd) // 2] if vpd else 0
+        max_v = vpd[-1] if vpd else 0
+        skew = "heavily right-skewed (a few viral outliers)" if max_v > med_v * 10 \
+            else "fairly even"
+        rel = ("like% falls as views rise — like-rate just tracks reach, not quality"
+               if r <= -0.2 else
+               "like% rises with views" if r >= 0.2 else
+               "no clear link between views and like%")
+        lines.append(
+            f"{name}: median duration {med_d}s; views/day median {_humanize(med_v)}, "
+            f"max {_humanize(max_v)} ({skew}); views-vs-like correlation r={r} ({rel}).")
+    return "\n".join(lines)
+
+
 def tool_ai_summary(ds):
     """
     Sends the computed signals to Claude for: a strategy brief, a per-signal read,
@@ -769,6 +831,7 @@ def tool_ai_summary(ds):
     n = len(ds["videos"])
     ns = sum(v["is_short"] for v in ds["videos"])
     signals = _collect_signals(ds)
+    distributions = _distribution_summary(ds)
     topic = ds.get("topic", "(unknown)")
 
     prompt = f"""You are a blunt, practical YouTube strategy analyst AND a QA reviewer \
@@ -780,6 +843,9 @@ Note: "velocity" = views per day. Shorts and long-form are analysed separately.
 
 Computed signals from the tool:
 {signals}
+
+Distribution data (from the charts):
+{distributions}
 
 Respond in markdown with EXACTLY these four sections:
 
