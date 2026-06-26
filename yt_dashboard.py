@@ -268,6 +268,23 @@ def by_tier(videos, tier):
     return [v for v in videos if lo <= v.get("subs", 0) < hi]
 
 
+def exclude_official(videos, topic):
+    """
+    Drop channels that look like the game's OWN official/brand channel — e.g. the
+    'Call of Duty' channel when searching 'call of duty'. Their trailers crush the
+    baseline and aren't creator content you can learn from.
+    """
+    t = topic.lower().strip()
+    kept = []
+    for v in videos:
+        name = v["channel"].lower()
+        # official if the channel name is basically the topic itself
+        if name == t or name.replace(" ", "") == t.replace(" ", ""):
+            continue
+        kept.append(v)
+    return kept
+
+
 def per_format(videos, fn):
     """Run an analysis fn on Shorts and long-form separately."""
     shorts, longform = by_format(videos)
@@ -338,56 +355,97 @@ def detect_script(text):
 # 3. TOOLS  — each returns {name, cost, summary, result}
 #    Every tool reports Shorts and long-form separately.
 # ======================================================================
+def _verdict(top, bottom):
+    """Plain-English read of a top-vs-bottom comparison, honest about ties."""
+    base = max(abs(top), abs(bottom), 1)
+    if abs(top - bottom) / base < 0.15:
+        return "no clear difference"
+    return "winners higher" if top > bottom else "winners lower"
+
+
+def _vid_card(v, baseline=None):
+    """A compact, link-ready dict for one video, with context numbers attached."""
+    card = {
+        "title": v["title"], "url": v.get("url", f"https://www.youtube.com/watch?v={v['id']}"),
+        "views": v["views"], "views_per_day": v.get("views_per_day"),
+        "age_days": v.get("age_days"),
+    }
+    if baseline:
+        card["vs_baseline"] = round(v.get("views_per_day", 0) / baseline, 2) if baseline else None
+    avg = v.get("channel_avg_views")
+    if avg:
+        card["vs_channel_avg"] = round(v["views"] / avg, 2) if avg else None
+    return card
+
+
 def tool_outliers(ds):
-    """Winners & underperformers vs each format's own median velocity."""
+    """
+    Ranks videos by views-per-day (velocity) against each FORMAT's own median.
+    Labels are descriptive ('fastest'/'slowest in batch'), NOT judgmental — a
+    low-velocity video may still beat its own channel, which we show too.
+    """
     def grp(vids):
         vals = [v["views_per_day"] for v in vids if v["views_per_day"] > 0]
         base = statistics.median(vals) if vals else 0
         for v in vids:
             v["score"] = round(v["views_per_day"] / base, 2) if base else 0
-        win = sorted([v for v in vids if v["score"] >= 2], key=lambda v: -v["score"])
-        lose = sorted([v for v in vids if 0 < v["score"] <= 0.5], key=lambda v: v["score"])
-        return {"baseline": base, "winners": win, "losers": lose,
-                "n": len(vids)}
+        fast = sorted([v for v in vids if v["score"] >= 2], key=lambda v: -v["score"])
+        slow = sorted([v for v in vids if 0 < v["score"] <= 0.5], key=lambda v: v["score"])
+        return {"baseline": round(base), "n": len(vids),
+                "fastest": [_vid_card(v, base) for v in fast],
+                "slowest": [_vid_card(v, base) for v in slow]}
     res = per_format(ds["videos"], grp)
-    summary = (f"Shorts: {len(res['shorts']['winners'])} winners / "
-               f"{len(res['shorts']['losers'])} flops | "
-               f"Long-form: {len(res['long']['winners'])} winners / "
-               f"{len(res['long']['losers'])} flops")
-    return {"name": "Outliers (winners & flops)", "cost": 0,
+    s, l = res["shorts"], res["long"]
+    summary = (f"Shorts median {s['baseline']:,}/day "
+               f"({len(s['fastest'])} above 2×, {len(s['slowest'])} below 0.5×) · "
+               f"Long-form median {l['baseline']:,}/day "
+               f"({len(l['fastest'])} above 2×, {len(l['slowest'])} below 0.5×)")
+    return {"name": "Velocity outliers (views/day vs niche median)", "cost": 0,
             "summary": summary, "result": res}
 
 
 def _presence_tool(name, pred):
-    """Factory: compares how often a title trait appears in top vs bottom videos."""
+    """Factory: how often a title trait appears in fastest vs slowest videos."""
     def tool(ds):
         def grp(vids):
             top, bot = top_bottom(vids)
+            def items(vs):
+                return [{"title": v["title"],
+                         "url": v.get("url", f"https://www.youtube.com/watch?v={v['id']}"),
+                         "views": v["views"], "value": "yes" if pred(v) else "no"}
+                        for v in vs]
             return {"top": _frac(top, pred), "bottom": _frac(bot, pred),
                     "top_n": len(top), "bottom_n": len(bot),
-                    "top_videos": top, "bottom_videos": bot}
+                    "top_items": items(top), "bottom_items": items(bot)}
         res = per_format(ds["videos"], grp)
         s = res["shorts"]
-        summary = (f"Shorts top {s['top']:.0%} vs bottom {s['bottom']:.0%}; "
-                   f"Long-form top {res['long']['top']:.0%} vs "
-                   f"bottom {res['long']['bottom']:.0%}")
+        verdict = _verdict(s["top"], s["bottom"])
+        summary = (f"Shorts: {verdict} — {s['top']:.0%} of fastest vs "
+                   f"{s['bottom']:.0%} of slowest "
+                   f"(based on {s['top_n']}+{s['bottom_n']} videos)")
         return {"name": name, "cost": 0, "summary": summary, "result": res}
     return tool
 
 
 def _numeric_tool(name, fn, unit=""):
-    """Factory: compares the median of a numeric trait in top vs bottom videos."""
+    """Factory: median of a numeric trait in fastest vs slowest, with per-video values."""
     def tool(ds):
         def grp(vids):
             top, bot = top_bottom(vids)
+            def items(vs):
+                return [{"title": v["title"],
+                         "url": v.get("url", f"https://www.youtube.com/watch?v={v['id']}"),
+                         "views": v["views"], "value": round(fn(v), 1)}
+                        for v in vs]
             return {"top": _med(top, fn), "bottom": _med(bot, fn),
                     "top_n": len(top), "bottom_n": len(bot),
-                    "top_videos": top, "bottom_videos": bot}
+                    "top_items": items(top), "bottom_items": items(bot)}
         res = per_format(ds["videos"], grp)
         s = res["shorts"]
-        summary = (f"Shorts top {s['top']:.1f}{unit} vs bottom {s['bottom']:.1f}{unit}; "
-                   f"Long top {res['long']['top']:.1f}{unit} vs "
-                   f"bottom {res['long']['bottom']:.1f}{unit}")
+        verdict = _verdict(s["top"], s["bottom"])
+        summary = (f"Shorts: {verdict} — fastest {s['top']:.1f}{unit} vs "
+                   f"slowest {s['bottom']:.1f}{unit} "
+                   f"(based on {s['top_n']}+{s['bottom_n']} videos)")
         return {"name": name, "cost": 0, "summary": summary, "result": res}
     return tool
 
@@ -566,8 +624,8 @@ TOOLS = {
     "outliers":    {"label": "Outliers (winners & flops)", "cat": "Discovery",
                     "func": tool_outliers, "needs_channel_stats": False},
     "title_len":   {"label": "Title length sweet spot", "cat": "Title",
-                    "func": _numeric_tool("Title length (words)",
-                                          lambda v: len(v["title"].split()), " words"),
+                    "func": _numeric_tool("Title length (characters)",
+                                          lambda v: len(v["title"]), " chars"),
                     "needs_channel_stats": False},
     "emoji":       {"label": "Emoji impact", "cat": "Title",
                     "func": _presence_tool("Emoji impact",
