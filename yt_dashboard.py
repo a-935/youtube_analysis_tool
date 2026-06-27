@@ -847,7 +847,9 @@ def _collect_signals(ds):
     have_cs = bool(ds["videos"]) and "channel_avg_views" in ds["videos"][0]
     lines = []
     for key, spec in TOOLS.items():
-        if key == "ai_summary":
+        if spec["cat"] == "AI":          # don't run (or charge) any paid AI tool here
+            continue
+        if key == "all_videos":          # the raw data dump isn't a "signal"
             continue
         if spec["needs_channel_stats"] and not have_cs:
             continue
@@ -954,6 +956,75 @@ Then suggest 2-3 concrete features or fixes the developer should add. Be specifi
             "result": {"text": res["text"]}}
 
 
+def tool_ai_ideas(ds):
+    """
+    Creative Claude tool: pitches concrete NEW video ideas built from what's actually
+    winning in THIS niche's data (not generic advice). Costs the Claude wallet.
+    Distinct from ai_summary, which audits the data/tool.
+    """
+    topic = ds.get("topic", "(unknown)")
+    shorts, longform = by_format(ds["videos"])
+
+    def fastest(vids, k=10):
+        return sorted([v for v in vids if v.get("views_per_day", 0) > 0],
+                      key=lambda v: -v["views_per_day"])[:k]
+
+    win_sh = [f'- "{v["title"]}" ({_humanize(v["views"])} views, {v["duration_sec"]}s)'
+              for v in fastest(shorts)]
+    win_lo = [f'- "{v["title"]}" ({_humanize(v["views"])} views)'
+              for v in fastest(longform)]
+    signals = _collect_signals(ds)
+
+    prompt = f"""You are a YouTube content strategist pitching NEW video ideas for a creator \
+in the "{topic}" niche. Base every idea ONLY on what is actually winning in their data \
+below — no generic advice.
+
+Top-performing Shorts:
+{chr(10).join(win_sh) or "(none)"}
+
+Top-performing long-form:
+{chr(10).join(win_lo) or "(none)"}
+
+Measured signals:
+{signals}
+
+Pitch exactly 5 specific, ready-to-film ideas. For EACH give:
+1. A working title that follows the patterns that win here (mind length, avoid ALL-CAPS).
+2. One line on the hook / first 3 seconds.
+3. Format: Short or long-form.
+4. One blunt line on how derivative-vs-fresh it is (don't pretend a copycat is original).
+
+Respond in markdown, numbered 1-5, no preamble."""
+
+    try:
+        res = _call_claude(prompt)
+    except Exception as e:
+        return {"name": "AI video ideas (Claude)", "cost": 0,
+                "summary": f"Claude call failed: {e}",
+                "result": {"text": "", "error": str(e)}}
+
+    out_tok = res["usage"].get("output_tokens", "?")
+    return {"name": "AI video ideas (Claude)", "cost": 0,
+            "claude_cost_usd": res["cost_usd"], "tokens": res["usage"],
+            "summary": f"5 ideas generated — ~${res['cost_usd']:.4f}, {out_tok} output tokens",
+            "result": {"text": res["text"]}}
+
+
+def tool_all_videos(ds):
+    """
+    Full browse table: EVERY video in the search with all its fields (views, likes,
+    comments, channel, release date, duration, velocity, subs, etc.). This is a raw
+    data dump for sorting/exporting — not an analysis — so Shorts and long-form share
+    one table but carry a 'format' flag you can sort by.
+    """
+    vids = ds["videos"]
+    ns = sum(v["is_short"] for v in vids)
+    summary = (f"{len(vids)} videos ({ns} Shorts, {len(vids) - ns} long-form) — "
+               f"full sortable table with thumbnails; download as CSV from the table toolbar.")
+    return {"name": "All videos (full table)", "cost": 0,
+            "summary": summary, "result": {"videos": vids}}
+
+
 # ======================================================================
 # 4. REGISTRY — the check-mark menu
 #    key -> {label, category, func, cost_note}
@@ -1014,6 +1085,10 @@ TOOLS = {
                     "func": tool_channels, "needs_channel_stats": False},
     "ai_summary":  {"label": "AI summary (Claude) — costs credit", "cat": "AI",
                     "func": tool_ai_summary, "needs_channel_stats": False},
+    "ai_ideas":    {"label": "AI video ideas (Claude) — costs credit", "cat": "AI",
+                    "func": tool_ai_ideas, "needs_channel_stats": False},
+    "all_videos":  {"label": "All videos (full table)", "cat": "Data",
+                    "func": tool_all_videos, "needs_channel_stats": False},
     "charts":      {"label": "Distribution charts", "cat": "Visual",
                     "func": tool_charts, "needs_channel_stats": False},
 }

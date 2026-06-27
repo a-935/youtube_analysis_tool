@@ -127,7 +127,7 @@ def outlier_table(cards):
         "<th style='padding:4px 8px;text-align:left'>Video</th>"
         "<th style='padding:4px 8px;text-align:right'>Views</th>"
         "<th style='padding:4px 8px;text-align:right'>× niche median</th>"
-        "<th style='padding:4px 8px;text-align:right'>× channel avg</th>"
+        "<th style='padding:4px 8px;text-align:right'>× channel typical</th>"
         "<th style='padding:4px 8px;text-align:right'>Age</th>"
         "</tr></thead><tbody>"
     )
@@ -219,11 +219,11 @@ st.sidebar.subheader("Tools to run")
 sa, ca = st.sidebar.columns(2)
 if sa.button("Select all", use_container_width=True):
     for k in engine.TOOLS:
-        st.session_state[f"chk_{k}"] = (k != "ai_summary")
+        st.session_state[f"chk_{k}"] = (engine.TOOLS[k]["cat"] != "AI")
 if ca.button("Clear all", use_container_width=True):
     for k in engine.TOOLS:
         st.session_state[f"chk_{k}"] = False
-st.sidebar.caption("'Select all' skips the paid AI summary — tick it yourself.")
+st.sidebar.caption("'Select all' skips the paid AI tools — tick those yourself.")
 
 TOOL_HELP = {
     "outliers": "Ranks videos by views-per-day vs the niche median. Shows fastest/slowest per format.",
@@ -242,6 +242,8 @@ TOOL_HELP = {
     "cadence": "Upload frequency vs total reach per channel (needs channel-stats fetch).",
     "channels": "Each channel's average views in this niche + how many of its videos beat that average.",
     "ai_summary": "Sends all the signals to Claude for a strategy brief, reliability check, and dev notes. Costs Claude credit.",
+    "ai_ideas": "Asks Claude to pitch 5 ready-to-film video ideas built from what's winning in THIS niche. Costs Claude credit.",
+    "all_videos": "A full sortable table of every video in the search — thumbnail, channel, views, likes, comments, release date, velocity, subs, everything. Download as CSV.",
     "freshness": "Trend-spike check: how OLD the niche's videos are. Mostly days/weeks old = exploding now (ride it fast); spread out = durable lane. Run with Max-age at 0 for an honest read.",
 }
 
@@ -300,7 +302,7 @@ if run:
 
     outputs = []
     for k in selected:
-        if k == "ai_summary":
+        if engine.TOOLS[k]["cat"] == "AI":
             with st.spinner("Asking Claude..."):
                 out = engine.TOOLS[k]["func"](ds)
             st.session_state.claude_used += out.get("claude_cost_usd", 0) or 0
@@ -308,9 +310,9 @@ if run:
             out = engine.TOOLS[k]["func"](ds)
         outputs.append((k, out))
 
-    # Render order: everything else first, charts next-to-last, AI summary last,
-    # so you read visuals then Claude's interpretation of them.
-    rank = {"charts": 1, "ai_summary": 2}
+    # Render order: everything else first, charts next, then the AI tools last,
+    # so you read the data/visuals before Claude's interpretation of them.
+    rank = {"charts": 1, "ai_summary": 2, "ai_ideas": 3}
     outputs.sort(key=lambda ko: rank.get(ko[0], 0))
 
     st.session_state.results = {
@@ -334,8 +336,9 @@ A video with 1,000 views in 2 days (500/day) is hotter right now than one with
 **Niche median** — the *typical* video in your search. Everything is compared to it.
 "2× niche median" means twice as fast as the typical video here.
 
-**× channel avg** — how much a video beat *its own channel's* normal. A video can be
-slow for the whole niche but still 6× its own channel — that means the idea worked
+**× channel typical** — how much a video beat *its own channel's* normal (the channel's
+median views across its recent uploads). A video can be slow for the whole niche but
+still 6× its own channel — that means the idea worked
 *for them*, even if the niche is bigger.
 
 **Shorts vs long-form** — always analysed separately. Shorts gather views much faster,
@@ -422,11 +425,60 @@ for key, out in R["outputs"]:
                     st.scatter_chart(pd.DataFrame(block["scatter"]),
                                      x="views", y="like_rate_pct")
 
-        elif key == "ai_summary":
+        elif key in ("ai_summary", "ai_ideas"):
             if result.get("text"):
                 st.markdown(result["text"])
             else:
                 st.error(result.get("error", "No response."))
+
+        elif key == "all_videos":
+            vids = result.get("videos", [])
+            if pd is None:
+                st.info("pandas is needed for the full table.")
+            elif not vids:
+                st.info("No videos to show.")
+            else:
+                rows = []
+                for v in vids:
+                    rows.append({
+                        "Thumb": v.get("thumbnail"),
+                        "Title": v.get("title"),
+                        "Link": v.get("url", f"https://www.youtube.com/watch?v={v.get('id', '')}"),
+                        "Channel": v.get("channel"),
+                        "Format": "Short" if v.get("is_short") else "Long",
+                        "Views": v.get("views"),
+                        "Likes": v.get("likes"),
+                        "Comments": v.get("comments"),
+                        "Like %": round((v.get("like_rate") or 0) * 100, 3),
+                        "Comment %": round((v.get("comment_rate") or 0) * 100, 3),
+                        "Views/day": v.get("views_per_day"),
+                        "Duration (s)": v.get("duration_sec"),
+                        "Age (days)": v.get("age_days"),
+                        "Released": (v.get("published") or "")[:10],
+                        "Weekday": v.get("weekday"),
+                        "Subs": v.get("subs"),
+                        "Views/sub": v.get("views_per_sub"),
+                        "Channel typical": v.get("channel_avg_views"),
+                    })
+                df = pd.DataFrame(rows)
+                try:
+                    st.dataframe(
+                        df, use_container_width=True, hide_index=True,
+                        column_config={
+                            "Thumb": st.column_config.ImageColumn("Thumb", width="small"),
+                            "Link": st.column_config.LinkColumn("Link", display_text="open"),
+                            "Views": st.column_config.NumberColumn(format="%d"),
+                            "Likes": st.column_config.NumberColumn(format="%d"),
+                            "Comments": st.column_config.NumberColumn(format="%d"),
+                            "Views/day": st.column_config.NumberColumn(format="%d"),
+                            "Subs": st.column_config.NumberColumn(format="%d"),
+                            "Channel typical": st.column_config.NumberColumn(format="%d"),
+                        },
+                    )
+                except Exception:
+                    st.dataframe(df, use_container_width=True, hide_index=True)
+                st.caption("Click any column header to sort. Hover the table and use its "
+                           "top-right toolbar to search or download everything as CSV.")
 
         elif key == "outliers":
             for fmt in ("shorts", "long"):
@@ -438,7 +490,7 @@ for key, out in R["outputs"]:
                     st.markdown(outlier_table(b["fastest"][:8]), unsafe_allow_html=True)
                 if b.get("slowest"):
                     st.markdown("Slowest (below 0.5× median) — a 'slow' video may still "
-                                "beat its own channel (see × channel avg):")
+                                "beat its own channel (see × channel typical):")
                     st.markdown(outlier_table(b["slowest"][:8]), unsafe_allow_html=True)
 
         elif key == "channels":
