@@ -12,7 +12,7 @@ RUN:  streamlit run app.py
 
 import os
 import html
-from datetime import date
+from datetime import date, timedelta
 
 
 def _load_env():
@@ -54,6 +54,16 @@ def _title_cell(c):
     return f"[{t}]({c['url']})"
 
 
+def _chan_cell(c):
+    # plain channel name, pipe/newline-escaped for markdown tables
+    return str(c.get("channel") or "").replace("|", "\\|").replace("\n", " ").strip()
+
+
+def _date_cell(c):
+    # YYYY-MM-DD release date from the ISO 'published' timestamp
+    return str(c.get("published") or "")[:10]
+
+
 def md_table(cards, cols):
     """Build a markdown table. cols = list of (header, fn(card)->str)."""
     if not cards:
@@ -73,9 +83,11 @@ VALUE_LABEL = {
 
 
 def pattern_table(cards, value_header):
-    cols = [("Video", _title_cell),
+    cols = [("Channel", _chan_cell),
+            ("Video", _title_cell),
             (value_header, lambda c: str(c.get("value", ""))),
-            ("Views", lambda c: fmt_views(c["views"]))]
+            ("Views", lambda c: fmt_views(c["views"])),
+            ("Released", _date_cell)]
     return md_table(cards, cols)
 
 
@@ -113,22 +125,24 @@ def outlier_table(cards):
 
         rows.append(
             "<tr>"
+            f"<td style='padding:4px 8px'>{html.escape(str(c.get('channel') or ''))}</td>"
             f"<td style='padding:4px 8px'><a href='{url}' target='_blank'>{title}</a></td>"
             f"<td style='padding:4px 8px;text-align:right'>{c.get('views', 0):,}</td>"
             f"<td style='padding:4px 8px;text-align:right'>{niche}</td>"
             f"<td style='padding:4px 8px;text-align:right'>{niche_chan}</td>"
-            f"<td style='padding:4px 8px;text-align:right'>{c.get('age_days', '—')}d</td>"
+            f"<td style='padding:4px 8px;text-align:right'>{str(c.get('published') or '')[:10]}</td>"
             "</tr>"
         )
 
     header = (
         "<table style='width:100%;border-collapse:collapse;font-size:0.9em'>"
         "<thead><tr style='border-bottom:1px solid #ccc'>"
+        "<th style='padding:4px 8px;text-align:left'>Channel</th>"
         "<th style='padding:4px 8px;text-align:left'>Video</th>"
         "<th style='padding:4px 8px;text-align:right'>Views</th>"
         "<th style='padding:4px 8px;text-align:right'>× niche median</th>"
         "<th style='padding:4px 8px;text-align:right'>× channel typical</th>"
-        "<th style='padding:4px 8px;text-align:right'>Age</th>"
+        "<th style='padding:4px 8px;text-align:right'>Released</th>"
         "</tr></thead><tbody>"
     )
     return header + "".join(rows) + "</tbody></table>"
@@ -159,17 +173,21 @@ def breakout_table(vids):
             subs_cell = f"{vps}×" if vps is not None else "—"
         rows.append(
             "<tr>"
+            f"<td style='padding:4px 8px'>{html.escape(str(v.get('channel') or ''))}</td>"
             f"<td style='padding:4px 8px'><a href='{url}' target='_blank'>{title}</a></td>"
             f"<td style='padding:4px 8px;text-align:right'>{subs_cell}</td>"
             f"<td style='padding:4px 8px;text-align:right'>{v.get('views', 0):,}</td>"
+            f"<td style='padding:4px 8px;text-align:right'>{str(v.get('published') or '')[:10]}</td>"
             "</tr>"
         )
     header = (
         "<table style='width:100%;border-collapse:collapse;font-size:0.9em'>"
         "<thead><tr style='border-bottom:1px solid #ccc'>"
+        "<th style='padding:4px 8px;text-align:left'>Channel</th>"
         "<th style='padding:4px 8px;text-align:left'>Video</th>"
         "<th style='padding:4px 8px;text-align:right'>× subs</th>"
         "<th style='padding:4px 8px;text-align:right'>Views</th>"
+        "<th style='padding:4px 8px;text-align:right'>Released</th>"
         "</tr></thead><tbody>"
     )
     return header + "".join(rows) + "</tbody></table>"
@@ -181,18 +199,65 @@ if not os.environ.get("ANTHROPIC_API_KEY"):
 
 topic = st.sidebar.text_input("Topic / genre", value="rocket league")
 
+region_label = st.sidebar.selectbox(
+    "Region / language", list(engine.REGIONS.keys()),
+    help="Bias the search toward one country/language. 'All regions' (default) searches "
+         "worldwide — handy, but it mixes Spanish/French/Arabic/etc. into the data. Pick "
+         "your language to get a cleaner read for your audience.")
+
+_today = date.today()
+
+# From date and Age are two views of ONE window. Editing either updates the other,
+# so they can never point at different start dates. They sync only when To = today
+# (the normal case); a custom past To date turns the age readout off rather than
+# showing a number that lies (age is always measured from today).
+if "from_date" not in st.session_state:
+    st.session_state.from_date = _today - timedelta(days=30)
+if "age_days" not in st.session_state:
+    st.session_state.age_days = 30
+if "to_date" not in st.session_state:
+    st.session_state.to_date = None
+
+
+def _sync_age_from_date():
+    # user edited From (or To): recompute age from today, if To is today/empty
+    to_d = st.session_state.get("to_date")
+    if to_d in (None, _today):
+        st.session_state.age_days = max((_today - st.session_state.from_date).days, 0)
+
+
+def _sync_date_from_age():
+    # user edited Age: move From to (today - age). Programmatic set does NOT
+    # re-fire the date callback, so there's no sync loop.
+    st.session_state.from_date = _today - timedelta(days=int(st.session_state.age_days))
+
+
 c1, c2 = st.sidebar.columns(2)
-after = c1.date_input("From", value=date(2025, 1, 1))
-before = c2.date_input("To (optional)", value=None)
+after = c1.date_input("From", key="from_date", on_change=_sync_age_from_date)
+before = c2.date_input("To (optional)", value=None, key="to_date",
+                       on_change=_sync_age_from_date)
+
+to_is_today = before in (None, _today)
+age = st.sidebar.number_input(
+    "Video age (days back from today)", min_value=0, step=1,
+    key="age_days", on_change=_sync_date_from_age, disabled=not to_is_today,
+    help="Same window as the From date, just counted in days. Change either one and "
+         "the other follows. Disabled when you pick a custom 'To' date, since age is "
+         "always measured from today.")
+
+# live readout so there's never any guessing about the actual window
+_end = "today" if to_is_today else before.isoformat()
+if to_is_today:
+    st.sidebar.caption(f"🔎 Searching {after.isoformat()} → {_end}  ·  {age} days")
+else:
+    _span = (before - after).days
+    st.sidebar.caption(f"🔎 Searching {after.isoformat()} → {_end}  ·  {_span}-day window "
+                       f"(age off — custom end date)")
 
 tier = st.sidebar.selectbox(
     "Channel size", ["all", "small", "medium", "large"],
     help="Subscriber-based tiers: small <100k . medium 100k-1M . large >1M. "
          "Note: these are FIXED thresholds, not relative to the niche yet.")
-
-max_age = st.sidebar.number_input(
-    "Max video age (days, 0 = no limit)", min_value=0, value=0, step=30,
-    help="0 keeps all videos. Raising the sample = leave at 0 + widen the From date.")
 
 per_format = st.sidebar.slider(
     "Videos per format", min_value=50, max_value=250, value=50, step=50,
@@ -274,8 +339,8 @@ if run:
                 after=after.isoformat() if after else None,
                 before=before.isoformat() if before else None,
                 balanced=balanced,
-                max_age_days=max_age or None,
                 videos_per_format=per_format,
+                region_label=region_label,
             )
         except Exception as ex:
             st.error(f"Fetch failed: {ex}")
@@ -294,7 +359,7 @@ if run:
         vids = engine.by_tier(vids, tier)
     ds = {**ds, "videos": vids}
 
-    charge_key = f"{topic}|{after}|{before}|{balanced}|{max_age}|{per_format}|{needs_cs}"
+    charge_key = f"{topic}|{region_label}|{after}|{before}|{balanced}|{per_format}|{needs_cs}"
     spent = (ds["cost"] + cs_cost) if not ds["from_cache"] else 0
     if spent and charge_key not in st.session_state.charged_keys:
         st.session_state.quota_used += spent
@@ -398,9 +463,10 @@ start_expanded = st.checkbox(
          "open it. The one-line summary shows in the header either way.")
 
 for key, out in R["outputs"]:
-    header = f"{out['name']} — {out['summary']}"
+    warn = engine.data_warning(key, out)
+    flag = "⚠ " if warn else ""
+    header = f"{flag}{out['name']} — {out['summary']}"
     with st.expander(header, expanded=start_expanded):
-        warn = engine.data_warning(key, out)
         if warn:
             st.warning(warn)
         result = out["result"]
@@ -446,9 +512,9 @@ for key, out in R["outputs"]:
                 for v in vids:
                     rows.append({
                         "Thumb": v.get("thumbnail"),
+                        "Channel": v.get("channel"),
                         "Title": v.get("title"),
                         "Link": v.get("url", f"https://www.youtube.com/watch?v={v.get('id', '')}"),
-                        "Channel": v.get("channel"),
                         "Format": "Short" if v.get("is_short") else "Long",
                         "Views": v.get("views"),
                         "Likes": v.get("likes"),

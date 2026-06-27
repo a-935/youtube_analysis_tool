@@ -26,7 +26,7 @@ import re
 import json
 import statistics
 from collections import Counter
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 import requests
 
@@ -39,6 +39,23 @@ TIERS = {"small": (0, 100_000), "medium": (100_000, 1_000_000), "large": (1_000_
 
 # Wallets. Quota resets daily (free). Claude credit is real money.
 WALLET = {"quota": 10_000, "claude_usd": 5.00}
+
+# Region / language presets for the search. Each maps to YouTube search params:
+#   regionCode = ISO country (affects availability), relevanceLanguage = ISO language
+#   (biases results toward that language). "All regions" = no filter (worldwide).
+# This lets an English creator stop having their RL data diluted by Spanish/French/etc.
+REGIONS = {
+    "All regions": None,
+    "English (US)": {"regionCode": "US", "relevanceLanguage": "en"},
+    "English (UK)": {"regionCode": "GB", "relevanceLanguage": "en"},
+    "Spanish": {"relevanceLanguage": "es"},
+    "Portuguese (Brazil)": {"regionCode": "BR", "relevanceLanguage": "pt"},
+    "French": {"relevanceLanguage": "fr"},
+    "German": {"relevanceLanguage": "de"},
+    "Arabic": {"relevanceLanguage": "ar"},
+    "Japanese": {"regionCode": "JP", "relevanceLanguage": "ja"},
+    "Korean": {"regionCode": "KR", "relevanceLanguage": "ko"},
+}
 
 # --- Claude (AI summary) config ---
 CLAUDE_MODEL = "claude-haiku-4-5-20251001"   # cheapest; swap to claude-sonnet-4-6 for deeper analysis
@@ -101,10 +118,12 @@ def parse_duration(iso):
 
 # ---- fetching ----------------------------------------------------------
 def search_ids(keyword, max_results=50, after=None, before=None,
-               order="viewCount", video_duration=None, pages=1):
+               order="viewCount", video_duration=None, pages=1, region=None):
     """
     YouTube search. Returns video IDs. COSTS 100 UNITS PER PAGE.
     pages=1 -> up to 50 IDs (100 units). pages=2 -> up to 100 IDs (200 units), etc.
+    'region' is an optional dict of extra search params (regionCode and/or
+    relevanceLanguage) to bias results toward a country/language. None = worldwide.
     """
     base = {"part": "id", "q": keyword, "type": "video",
             "order": order, "maxResults": 50}
@@ -114,6 +133,8 @@ def search_ids(keyword, max_results=50, after=None, before=None,
         base["publishedBefore"] = f"{before}T00:00:00Z"
     if video_duration:
         base["videoDuration"] = video_duration
+    if region:
+        base.update(region)        # regionCode / relevanceLanguage
     ids, token = [], None
     for _ in range(max(1, pages)):
         params = dict(base)
@@ -186,31 +207,54 @@ def enrich(videos, subs_map=None):
 
 def fetch_dataset(topic, after=None, before=None, max_results=50,
                   balanced=True, max_age_days=None, use_cache=True,
-                  videos_per_format=50):
+                  videos_per_format=50, region_label="All regions"):
     """
     Orchestrates a full fetch and returns a Dataset:
       {topic, videos, cost, from_cache}
     'balanced' fetches Shorts AND long-form separately (2 searches).
     'videos_per_format' = how many videos to pull per format. Each 50 is one
     search PAGE = 100 units. So 100 videos/format balanced = 4 pages = 400 units.
+    'region_label' picks a REGIONS preset to bias results to a country/language.
     Results are cached so an identical call later costs 0.
     """
+    region = REGIONS.get(region_label)
     pages = max(1, (videos_per_format + 49) // 50)
+
+    # KEY FIX: 'max_age_days' now drives the SEARCH window, not just a post-filter.
+    # Before, the search used the (often months-old) 'From' date and order=viewCount,
+    # so it pulled the all-time top videos since 'From' and then threw away everything
+    # older than max_age_days — wasting quota and leaving a tiny sample. Now we move
+    # publishedAfter up to (today - max_age_days) when that's more recent than 'From',
+    # so the API returns recent videos directly. We keep the post-filter as a safety net.
+    search_after = after
+    if max_age_days:
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=max_age_days)).strftime("%Y-%m-%d")
+        if search_after is None or cutoff > search_after:
+            search_after = cutoff
+
     cache = _load_cache()
-    key = json.dumps(["v3", topic, after, before, balanced, max_age_days, pages])
+    # region_label + the effective search window are part of the key so different
+    # regions/windows cache separately (and a new day re-fetches when max_age is set).
+    key = json.dumps(["v5", topic, search_after, before, balanced, max_age_days, pages,
+                      region_label])
+    requested_per_format = pages * 50
+    window = {"after": search_after, "before": before, "region": region_label}
+
     if use_cache and key in cache:
-        return {"topic": topic, "videos": cache[key], "cost": 0, "from_cache": True}
+        vids = cache[key]
+        return {"topic": topic, "videos": vids, "cost": 0, "from_cache": True,
+                "meta": _fetch_meta(vids, requested_per_format, balanced, window, 0)}
 
     cost = 0
     if balanced:
-        ids = search_ids(topic, after=after, before=before,
-                         video_duration="short", pages=pages)
-        ids += search_ids(topic, after=after, before=before,
-                          video_duration="medium", pages=pages)
+        ids = search_ids(topic, after=search_after, before=before,
+                         video_duration="short", pages=pages, region=region)
+        ids += search_ids(topic, after=search_after, before=before,
+                          video_duration="medium", pages=pages, region=region)
         ids = list(dict.fromkeys(ids))
         cost += 100 * pages * 2
     else:
-        ids = search_ids(topic, after=after, before=before, pages=pages)
+        ids = search_ids(topic, after=search_after, before=before, pages=pages, region=region)
         cost += 100 * pages
 
     videos = get_videos_details(ids)
@@ -223,7 +267,22 @@ def fetch_dataset(topic, after=None, before=None, max_results=50,
 
     cache[key] = videos
     _save_cache(cache)
-    return {"topic": topic, "videos": videos, "cost": cost, "from_cache": False}
+    return {"topic": topic, "videos": videos, "cost": cost, "from_cache": False,
+            "meta": _fetch_meta(videos, requested_per_format, balanced, window, cost)}
+
+
+def _fetch_meta(videos, requested_per_format, balanced, window, cost):
+    """Lightweight fetch diagnostics so the AI audit can see how much of what we
+    requested actually came back (and flag a too-narrow window / tiny niche)."""
+    ns = sum(v["is_short"] for v in videos)
+    requested_total = requested_per_format * (2 if balanced else 1)
+    returned = len(videos)
+    fill = round(returned / requested_total, 2) if requested_total else 0
+    return {"requested_per_format": requested_per_format,
+            "requested_total": requested_total,
+            "returned_total": returned, "returned_shorts": ns,
+            "returned_long": returned - ns, "fill_ratio": fill,
+            "quota_cost": cost, "window": window}
 
 
 def fetch_channel_stats(dataset):
@@ -398,6 +457,7 @@ def _vid_card(v, baseline=None):
         "title": v["title"], "url": v.get("url", f"https://www.youtube.com/watch?v={v['id']}"),
         "views": v["views"], "views_per_day": v.get("views_per_day"),
         "age_days": v.get("age_days"), "channel": v.get("channel"),
+        "published": v.get("published"),
     }
     if baseline:
         card["baseline"] = round(baseline)
@@ -441,8 +501,9 @@ def _presence_tool(name, pred):
         def grp(vids):
             top, bot = top_bottom(vids)
             def items(vs):
-                return [{"title": v["title"],
+                return [{"title": v["title"], "channel": v.get("channel"),
                          "url": v.get("url", f"https://www.youtube.com/watch?v={v['id']}"),
+                         "published": v.get("published"),
                          "views": v["views"], "value": "yes" if pred(v) else "no"}
                         for v in vs]
             return {"top": _frac(top, pred), "bottom": _frac(bot, pred),
@@ -466,8 +527,9 @@ def _numeric_tool(name, fn, unit="", decimals=1):
         def grp(vids):
             top, bot = top_bottom(vids)
             def items(vs):
-                return [{"title": v["title"],
+                return [{"title": v["title"], "channel": v.get("channel"),
                          "url": v.get("url", f"https://www.youtube.com/watch?v={v['id']}"),
+                         "published": v.get("published"),
                          "views": v["views"], "value": round(fn(v), decimals)}
                         for v in vs]
             return {"top": _med(top, fn), "bottom": _med(bot, fn),
@@ -842,8 +904,33 @@ def _call_claude(prompt, max_tokens=1400):
     return {"text": text, "usage": u, "cost_usd": round(cost, 4)}
 
 
+# What each tool is FOR — fed to the AI so it can judge whether a tool is working as
+# intended and whether it's even relevant for the niche, not just read its number.
+PURPOSES = {
+    "outliers": "Rank videos by velocity (views/day) vs the niche median to surface what's over/under-performing.",
+    "title_len": "Test whether title length (chars) separates faster from slower videos.",
+    "emoji": "Test whether using emoji in the title separates faster from slower videos.",
+    "question": "Test whether question-style titles separate faster from slower videos.",
+    "numbers": "Test whether numbers/$ in the title separate faster from slower videos.",
+    "caps": "Test whether ALL-CAPS words in the title separate faster from slower videos.",
+    "hook": "Surface the most common opening words among the fastest videos (qualitative).",
+    "duration": "Test whether video length (seconds) separates faster from slower videos.",
+    "timing": "Surface which weekday the fastest videos tend to post on (qualitative).",
+    "like_rate": "Test whether like-per-view separates faster from slower videos (suspected reach artifact).",
+    "comment_rate": "Test whether comment-per-view separates faster from slower videos.",
+    "breakouts": "Find videos that beat their channel's subscriber count the most (views/subs).",
+    "chan_outlier": "Compare each video to its OWN channel's typical views (needs channel stats).",
+    "cadence": "Relate a channel's upload frequency to its total reach (needs channel stats).",
+    "channels": "Per-channel median views in this niche + how many of its videos beat that median.",
+    "saturation": "Measure how concentrated the niche is (distinct channels, top channel's share).",
+    "language": "Split titles by script/language to reveal the regional mix in the results.",
+    "freshness": "Median video age — flags a trend spike when most videos are very recent.",
+}
+
+
 def _collect_signals(ds):
-    """Run the free analysis tools and gather their one-line summaries for Claude."""
+    """Run the free analysis tools and gather, per tool, its INTENDED PURPOSE plus its
+    one-line result — so Claude can audit whether each is working and relevant."""
     have_cs = bool(ds["videos"]) and "channel_avg_views" in ds["videos"][0]
     lines = []
     for key, spec in TOOLS.items():
@@ -855,10 +942,34 @@ def _collect_signals(ds):
             continue
         try:
             out = spec["func"](ds)
-            lines.append(f"- {out['name']}: {out['summary']}")
+            purpose = PURPOSES.get(key, "")
+            min_v = MIN_VIDEOS.get(key)
+            tag = f" [purpose: {purpose}]" if purpose else ""
+            tag += f" [min sample wanted: {min_v}/group]" if min_v else ""
+            lines.append(f"- {out['name']}{tag}: {out['summary']}")
         except Exception:
             pass
     return "\n".join(lines)
+
+
+def _fetch_diagnostics(ds):
+    """Plain-text fetch report so the AI can flag a too-narrow window / tiny niche /
+    wasted quota — things invisible from the signal numbers alone."""
+    m = ds.get("meta")
+    if not m:
+        return "Fetch diagnostics: not available."
+    w = m.get("window", {})
+    src = "from cache (0 quota)" if ds.get("from_cache") else f"{m.get('quota_cost', 0)} quota units"
+    note = ""
+    if m.get("requested_total") and m.get("fill_ratio", 1) < 0.5:
+        note = (f" NOTE: only {m['returned_total']} of ~{m['requested_total']} requested came "
+                f"back ({int(m['fill_ratio']*100)}%) — the search window may be too narrow or "
+                f"the niche too small for this window; the sample is supply-limited, not a bug.")
+    return (f"Fetch diagnostics: requested up to {m.get('requested_per_format')}/format; "
+            f"returned {m.get('returned_total')} videos "
+            f"({m.get('returned_shorts')} Shorts, {m.get('returned_long')} long-form); "
+            f"window {w.get('after')}→{w.get('before') or 'today'}, region '{w.get('region')}'; "
+            f"spent {src}.{note}")
 
 
 def _corr(xs, ys):
@@ -909,6 +1020,7 @@ def tool_ai_summary(ds):
     ns = sum(v["is_short"] for v in ds["videos"])
     signals = _collect_signals(ds)
     distributions = _distribution_summary(ds)
+    diagnostics = _fetch_diagnostics(ds)
     topic = ds.get("topic", "(unknown)")
 
     prompt = f"""You are a blunt, practical YouTube strategy analyst AND a QA reviewer \
@@ -918,13 +1030,16 @@ Topic searched: "{topic}"
 Sample size: {n} videos ({ns} Shorts, {n - ns} long-form).
 Note: "velocity" = views per day. Shorts and long-form are analysed separately.
 
-Computed signals from the tool:
+{diagnostics}
+
+Computed signals from the tool. Each line gives the tool's INTENDED PURPOSE and the \
+minimum per-group sample it wants, then its result:
 {signals}
 
 Distribution data (from the charts):
 {distributions}
 
-Respond in markdown with EXACTLY these four sections:
+Respond in markdown with EXACTLY these five sections:
 
 ## Strategy brief
 2-4 sentences: what kind of content wins in this niche and what the user should make next.
@@ -937,13 +1052,20 @@ Be blunt about reliability given the sample size. If comparisons rest on very fe
 videos (e.g. 1 vs 1), say plainly the findings are NOT yet trustworthy and state roughly \
 how many videos would be needed to trust them.
 
+## Tool audit (is each tool working & relevant?)
+Go through the tools using the stated PURPOSE of each. For each notable one say whether it \
+is (a) working as intended, (b) relevant to THIS niche, or (c) broken / redundant / a data \
+void / measuring something it doesn't claim to. Call out tools that should be cut or fixed, \
+and any whose sample is below its stated minimum. Use the fetch diagnostics above: if far \
+fewer videos came back than were requested, say the window is too narrow or the niche too \
+thin for it, and that this — not the tools — is what's making samples unreliable.
+
 ## Developer notes (data accuracy & feature ideas)
-You are auditing the TOOL itself, not just the niche. Flag anything that looks like a \
-data error, a misleading metric, a statistically unsound comparison, or a likely bug. \
-Then suggest 2-3 concrete features or fixes the developer should add. Be specific."""
+Flag anything that looks like a data error, misleading metric, unsound comparison, or likely \
+bug not already covered above. Then suggest 2-3 concrete features or fixes. Be specific."""
 
     try:
-        res = _call_claude(prompt)
+        res = _call_claude(prompt, max_tokens=1800)
     except Exception as e:
         return {"name": "AI summary (Claude)", "cost": 0,
                 "summary": f"Claude call failed: {e}",
