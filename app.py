@@ -134,8 +134,45 @@ def outlier_table(cards):
     return header + "".join(rows) + "</tbody></table>"
 
 
-# ---------------- SIDEBAR ----------------
-st.sidebar.title("Niche Research")
+def breakout_table(vids):
+    """HTML table whose '× subs' value reveals the raw math on hover:
+    channel name, the video's views, and the channel's subscriber count.
+    Rendered with unsafe_allow_html=True."""
+    if not vids:
+        return ""
+
+    def tip(text, tip_text):
+        return f'<span title="{html.escape(tip_text, quote=True)}">{text}</span>'
+
+    rows = []
+    for v in vids:
+        title = html.escape(str(v.get("title", "")))
+        url = html.escape(v.get("url", f"https://www.youtube.com/watch?v={v.get('id', '')}"),
+                          quote=True)
+        vps = v.get("views_per_sub")
+        subs = v.get("subs")
+        chan = html.escape(str(v.get("channel", "this channel")))
+        if vps is not None and subs:
+            subs_cell = tip(f"{vps}×",
+                            f"{chan} — {v.get('views', 0):,} views  ÷  {subs:,} subscribers  =  {vps}×")
+        else:
+            subs_cell = f"{vps}×" if vps is not None else "—"
+        rows.append(
+            "<tr>"
+            f"<td style='padding:4px 8px'><a href='{url}' target='_blank'>{title}</a></td>"
+            f"<td style='padding:4px 8px;text-align:right'>{subs_cell}</td>"
+            f"<td style='padding:4px 8px;text-align:right'>{v.get('views', 0):,}</td>"
+            "</tr>"
+        )
+    header = (
+        "<table style='width:100%;border-collapse:collapse;font-size:0.9em'>"
+        "<thead><tr style='border-bottom:1px solid #ccc'>"
+        "<th style='padding:4px 8px;text-align:left'>Video</th>"
+        "<th style='padding:4px 8px;text-align:right'>× subs</th>"
+        "<th style='padding:4px 8px;text-align:right'>Views</th>"
+        "</tr></thead><tbody>"
+    )
+    return header + "".join(rows) + "</tbody></table>"
 
 if not os.environ.get("YT_KEY"):
     st.sidebar.error("No YouTube key. Add YT_KEY=... to your .env")
@@ -205,6 +242,7 @@ TOOL_HELP = {
     "cadence": "Upload frequency vs total reach per channel (needs channel-stats fetch).",
     "channels": "Each channel's average views in this niche + how many of its videos beat that average.",
     "ai_summary": "Sends all the signals to Claude for a strategy brief, reliability check, and dev notes. Costs Claude credit.",
+    "freshness": "Trend-spike check: how OLD the niche's videos are. Mostly days/weeks old = exploding now (ride it fast); spread out = durable lane. Run with Max-age at 0 for an honest read.",
 }
 
 selected = []
@@ -355,6 +393,9 @@ for key, out in R["outputs"]:
     with st.container(border=True):
         st.subheader(out["name"])
         st.caption(out["summary"])
+        warn = engine.data_warning(key, out)
+        if warn:
+            st.warning(warn)
         result = out["result"]
 
         if key == "charts":
@@ -425,10 +466,7 @@ for key, out in R["outputs"]:
                 vids = result.get(fmt, {}).get("top", [])
                 if vids:
                     st.markdown(f"**{fmt.title()}**")
-                    cols = [("Video", _title_cell),
-                            ("× subs", lambda c: f"{c['views_per_sub']}×"),
-                            ("Views", lambda c: fmt_views(c["views"]))]
-                    st.markdown(md_table(vids[:8], cols))
+                    st.markdown(breakout_table(vids[:8]), unsafe_allow_html=True)
 
         elif key in ("title_len", "emoji", "question", "numbers", "caps",
                      "duration", "like_rate", "comment_rate"):

@@ -573,6 +573,47 @@ def tool_language_split(ds):
             "summary": summary, "result": res}
 
 
+def tool_freshness(ds):
+    """
+    Trend-spike check. Looks at how OLD the videos in this niche are. If almost
+    everything is days/weeks old, the niche is exploding right now — the findings
+    reflect that wave (and the game's virality), not a durable, repeatable lane.
+    Caveat: if you set a 'Max video age' filter, ages are bounded by it, so run
+    this with the age filter at 0 for an honest read.
+    """
+    def grp(vids):
+        ages = sorted(v["age_days"] for v in vids if v.get("age_days"))
+        if not ages:
+            return {"n": 0}
+        med = ages[len(ages) // 2]
+        share_recent = round(sum(1 for a in ages if a <= 30) / len(ages), 2)
+        return {"n": len(ages), "median_age_days": med,
+                "share_under_30d": share_recent, "oldest_days": ages[-1]}
+
+    res = per_format(ds["videos"], grp)
+    lead = res["shorts"] if res["shorts"].get("n") else res["long"]
+    if not lead.get("n"):
+        return {"name": "Niche freshness (trend-spike check)", "cost": 0,
+                "summary": "No dated videos to judge.", "result": res}
+
+    med = lead["median_age_days"]
+    share = lead.get("share_under_30d", 0)
+    if med <= 30 and share >= 0.8:
+        verdict = ("⚡ TREND SPIKE — most videos are days/weeks old. The niche is "
+                   "exploding right now; signals reflect the wave (the game going "
+                   "viral), not a durable lane. Worth riding NOW, but expect it to cool.")
+    elif med <= 90:
+        verdict = "Warming — fairly recent activity; neither a spike nor fully evergreen."
+    else:
+        verdict = "Evergreen — videos span a long time, so findings are likely durable."
+
+    s_med = res["shorts"].get("median_age_days", "?")
+    l_med = res["long"].get("median_age_days", "?")
+    summary = f"Median age — Shorts {s_med}d / Long {l_med}d. {verdict}"
+    return {"name": "Niche freshness (trend-spike check)", "cost": 0,
+            "summary": summary, "result": res}
+
+
 def tool_channel_outlier(ds):
     """Each video vs ITS OWN channel's average views. Needs fetch_channel_stats first."""
     if not ds["videos"] or "channel_avg_views" not in ds["videos"][0]:
@@ -962,6 +1003,8 @@ TOOLS = {
                     "func": tool_saturation, "needs_channel_stats": False},
     "language":    {"label": "Language / region split", "cat": "Niche",
                     "func": tool_language_split, "needs_channel_stats": False},
+    "freshness":   {"label": "Niche freshness (trend-spike check)", "cat": "Niche",
+                    "func": tool_freshness, "needs_channel_stats": False},
     "chan_outlier": {"label": "Per-channel over/under", "cat": "Channel",
                      "func": tool_channel_outlier, "needs_channel_stats": True},
     "cadence":     {"label": "Upload cadence vs reach", "cat": "Channel",
@@ -974,6 +1017,49 @@ TOOLS = {
     "charts":      {"label": "Distribution charts", "cat": "Visual",
                     "func": tool_charts, "needs_channel_stats": False},
 }
+
+
+# ======================================================================
+# SAMPLE-SIZE HONESTY — each comparison tool declares a minimum sample.
+# Below it, the GUI stamps a "needs more data" warning instead of pretending
+# a top-third-vs-bottom-third split on a handful of videos is meaningful.
+# (Pattern/timing tools only — descriptive tools like saturation aren't
+# top-vs-bottom comparisons, so a small sample doesn't mislead the same way.)
+# ======================================================================
+MIN_VIDEOS = {
+    "title_len": 30, "emoji": 30, "question": 30, "numbers": 30, "caps": 30,
+    "hook": 30, "duration": 30, "timing": 30, "like_rate": 30, "comment_rate": 30,
+}
+
+
+def data_warning(key, out):
+    """Return a warning string if this tool's smallest comparison group is below its
+    declared minimum, else None. Works off the per-format group sizes the tool reports
+    (top_n/bottom_n for pattern tools, n for hook/timing)."""
+    thresh = MIN_VIDEOS.get(key)
+    if not thresh:
+        return None
+    res = out.get("result", {})
+    sizes = []
+    for fmt in ("shorts", "long"):
+        block = res.get(fmt)
+        if not isinstance(block, dict):
+            continue
+        if "top_n" in block and "bottom_n" in block:
+            grp = min(block["top_n"], block["bottom_n"])
+        elif "n" in block:
+            grp = block["n"]
+        else:
+            continue
+        if grp > 0:
+            sizes.append(grp)
+    if not sizes:
+        return None
+    smallest = min(sizes)
+    if smallest < thresh:
+        return (f"⚠ Needs more data — the smaller comparison group has only "
+                f"{smallest} video(s) (want {thresh}+). Treat this as a hint, not a fact.")
+    return None
 
 
 def menu():
