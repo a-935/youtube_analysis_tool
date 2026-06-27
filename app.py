@@ -392,10 +392,14 @@ def render_pattern(result, value_header):
             st.markdown(pattern_table(bot[:6], value_header))
 
 
+start_expanded = st.checkbox(
+    "Expand all tools", value=False,
+    help="Off = each tool starts collapsed (less scrolling); click a tool's header to "
+         "open it. The one-line summary shows in the header either way.")
+
 for key, out in R["outputs"]:
-    with st.container(border=True):
-        st.subheader(out["name"])
-        st.caption(out["summary"])
+    header = f"{out['name']} — {out['summary']}"
+    with st.expander(header, expanded=start_expanded):
         warn = engine.data_warning(key, out)
         if warn:
             st.warning(warn)

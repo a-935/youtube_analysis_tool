@@ -1108,15 +1108,17 @@ MIN_VIDEOS = {
 
 
 def data_warning(key, out):
-    """Return a warning string if this tool's smallest comparison group is below its
-    declared minimum, else None. Works off the per-format group sizes the tool reports
-    (top_n/bottom_n for pattern tools, n for hook/timing)."""
+    """Return a warning naming any FORMAT whose comparison group is below the minimum,
+    else None. Each pattern tool compares the fastest third vs the slowest third of a
+    format, so a group is ~1/3 of that format's videos — NOT the total search size.
+    The old message reported a bare number with no format label, which read like 'you
+    only got N videos' (you didn't)."""
     thresh = MIN_VIDEOS.get(key)
     if not thresh:
         return None
     res = out.get("result", {})
-    sizes = []
-    for fmt in ("shorts", "long"):
+    thin = []
+    for fmt, label in (("shorts", "Shorts"), ("long", "long-form")):
         block = res.get(fmt)
         if not isinstance(block, dict):
             continue
@@ -1126,15 +1128,14 @@ def data_warning(key, out):
             grp = block["n"]
         else:
             continue
-        if grp > 0:
-            sizes.append(grp)
-    if not sizes:
+        if 0 < grp < thresh:
+            thin.append(f"{label} (~{grp} per group)")
+    if not thin:
         return None
-    smallest = min(sizes)
-    if smallest < thresh:
-        return (f"⚠ Needs more data — the smaller comparison group has only "
-                f"{smallest} video(s) (want {thresh}+). Treat this as a hint, not a fact.")
-    return None
+    return ("⚠ Small sample for " + ", ".join(thin) + ". This tool compares only the "
+            "fastest third vs the slowest third of EACH format, so a group is about a "
+            "third of that format's videos — not your whole search. Want 30+ per group; "
+            "treat the flagged format as a hint, not a fact.")
 
 
 def menu():
