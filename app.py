@@ -300,8 +300,8 @@ TOOL_HELP = {
     "hook": "Most common opening words among the fastest videos.",
     "duration": "Video length (seconds) of faster vs slower videos.",
     "timing": "Which weekday the fastest videos tend to post on.",
-    "like_rate": "Likes-per-view of faster vs slower videos.",
-    "comment_rate": "Comments-per-view of faster vs slower videos.",
+    "like_rate": "Likes-per-view of faster vs slower videos. Reach artifact — slower/smaller videos draw MORE likes per view, so it's diagnostic, not a target to optimize.",
+    "comment_rate": "Comments-per-view of faster vs slower videos. Reach artifact like like-rate — slower videos draw more comments per view. Diagnostic, not a target.",
     "breakouts": "Videos that beat their channel's subscriber count the most (views/subs).",
     "chan_outlier": "Each video vs its OWN channel average (needs channel-stats fetch).",
     "cadence": "Upload frequency vs total reach per channel (needs channel-stats fetch).",
@@ -577,9 +577,17 @@ for key, out in R["outputs"]:
                                 f"{fmt_views(r['typical_views'])} views (single data point)")
                         with st.expander(head):
                             st.markdown(md_table(r["all_videos"], vcols))
+                    elif r.get("above_count") is None:
+                        # no channel-stats fetch -> we can't compare to the all-time
+                        # median, so we DON'T show a tautological "X above" count
+                        head = (f"{r['channel']} — median {r['typical_views']:,} here over "
+                                f"{r['n']} videos (run channel stats for a consistency read)")
+                        with st.expander(head):
+                            st.markdown(md_table(r["all_videos"], vcols))
                     else:
-                        head = (f"{r['channel']} — median {r['typical_views']:,} over "
-                                f"{r['n']} videos . {r['above_count']} above their median")
+                        head = (f"{r['channel']} — median {r['typical_views']:,} here over "
+                                f"{r['n']} videos . {r['above_count']} of {r['n']} beat "
+                                f"their all-time median ({r['alltime_median']:,})")
                         with st.expander(head):
                             st.markdown(md_table(r["above_videos"], vcols))
 

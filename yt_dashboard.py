@@ -34,6 +34,11 @@ BASE = "https://www.googleapis.com/youtube/v3"
 SHORTS_MAX_SECONDS = 180        # <= 3 min counts as a Short (heuristic)
 CACHE_FILE = "yt_cache.json"
 
+# Videos under this many TOTAL views are kept OUT of the niche-median baseline (they're
+# still scored and shown). Abandoned livestream VODs with a handful of views otherwise
+# drag the long-form median to absurd lows and inflate every "x niche median". Tune here.
+BASELINE_MIN_VIEWS = 500
+
 # Channel-size tiers (subscriber thresholds — adjustable)
 TIERS = {"small": (0, 100_000), "medium": (100_000, 1_000_000), "large": (1_000_000, 10**12)}
 
@@ -205,6 +210,27 @@ def enrich(videos, subs_map=None):
     return videos
 
 
+def refresh_ages(videos):
+    """Recompute the time-dependent fields (age_days, views_per_day) from each video's
+    'published' timestamp using the CURRENT time.
+
+    Why: age_days is otherwise FROZEN at fetch time and cached. A cached run viewed a day
+    later understates every velocity — worst for 1-2 day old videos, where one extra day
+    is most of the denominator (a 1-day-old video read as still 1 day old overstates its
+    views/day by ~2x once it's actually 2 days old). All other derived fields (like_rate,
+    comment_rate, weekday, subs) are time-invariant, so we leave them untouched."""
+    now = datetime.now(timezone.utc)
+    for v in videos:
+        try:
+            pub = datetime.fromisoformat(v["published"].replace("Z", "+00:00"))
+        except Exception:
+            continue                       # leave the stored values if the date is junk
+        age = max((now - pub).days, 1)
+        v["age_days"] = age
+        v["views_per_day"] = round(v["views"] / age, 1)
+    return videos
+
+
 def fetch_dataset(topic, after=None, before=None, max_results=50,
                   balanced=True, max_age_days=None, use_cache=True,
                   videos_per_format=50, region_label="All regions"):
@@ -242,6 +268,7 @@ def fetch_dataset(topic, after=None, before=None, max_results=50,
 
     if use_cache and key in cache:
         vids = cache[key]
+        refresh_ages(vids)        # cached ages are frozen at fetch time — recompute to "now"
         return {"topic": topic, "videos": vids, "cost": 0, "from_cache": True,
                 "meta": _fetch_meta(vids, requested_per_format, balanced, window, 0)}
 
@@ -441,9 +468,17 @@ def detect_script(text):
 # 3. TOOLS  — each returns {name, cost, summary, result}
 #    Every tool reports Shorts and long-form separately.
 # ======================================================================
-def _verdict(top, bottom):
-    """Plain-English read of a top-vs-bottom comparison, honest about ties."""
-    base = max(abs(top), abs(bottom), 1)
+def _verdict(top, bottom, min_base=1):
+    """Plain-English read of a top-vs-bottom comparison, honest about ties.
+
+    'min_base' floors the denominator to stop a divide-by-near-zero from turning a
+    meaningless wobble into a "signal". The default of 1 is right for proportion metrics
+    (emoji/question/numbers live on 0-1, so a 14-point gap genuinely IS small) and for
+    metrics whose values exceed 1 anyway (like-rate %). But comment-rate lives at ~0.02-
+    0.05%, so a floor of 1 swallows it whole and it ALWAYS reads "no clear difference" even
+    when slow videos clearly draw 2-3x the comments per view (the same reach artifact as
+    like-rate). Such metrics pass a smaller min_base so their real range isn't erased."""
+    base = max(abs(top), abs(bottom), min_base)
     if abs(top - bottom) / base < 0.15:
         return "no clear difference"
     return "winners higher" if top > bottom else "winners lower"
@@ -476,8 +511,15 @@ def tool_outliers(ds):
     low-velocity video may still beat its own channel, which we show too.
     """
     def grp(vids):
-        vals = [v["views_per_day"] for v in vids if v["views_per_day"] > 0]
-        base = statistics.median(vals) if vals else 0
+        # Baseline = median velocity of REAL videos. Exclude near-dead ones (abandoned
+        # VODs with a handful of views) from the reference only — they still get scored
+        # against it and still appear in the lists. Fall back to all videos if the floor
+        # would empty the pool (tiny niche), so base is never 0 by accident.
+        pool = [v["views_per_day"] for v in vids
+                if v["views_per_day"] > 0 and v["views"] >= BASELINE_MIN_VIEWS]
+        if not pool:
+            pool = [v["views_per_day"] for v in vids if v["views_per_day"] > 0]
+        base = statistics.median(pool) if pool else 0
         for v in vids:
             v["score"] = round(v["views_per_day"] / base, 2) if base else 0
         fast = sorted([v for v in vids if v["score"] >= 2], key=lambda v: -v["score"])
@@ -519,10 +561,14 @@ def _presence_tool(name, pred):
     return tool
 
 
-def _numeric_tool(name, fn, unit="", decimals=1):
+def _numeric_tool(name, fn, unit="", decimals=1, min_base=1, caveat=""):
     """Factory: median of a numeric trait in fastest vs slowest, with per-video values.
     'decimals' controls display precision — comment-rate needs more than 1 dp or it
-    rounds to a useless 0.0% for every video."""
+    rounds to a useless 0.0% for every video.
+    'min_base' is passed to _verdict; metrics with a tiny natural range (comment-rate)
+    pass a small value so the verdict can actually see their differences.
+    'caveat' is appended to the summary header for signals that are real but weak/
+    format-dependent, so the warning shows in the collapsed UI (not buried)."""
     def tool(ds):
         def grp(vids):
             top, bot = top_bottom(vids)
@@ -537,10 +583,12 @@ def _numeric_tool(name, fn, unit="", decimals=1):
                     "top_items": items(top), "bottom_items": items(bot)}
         res = per_format(ds["videos"], grp)
         s = res["shorts"]
-        verdict = _verdict(s["top"], s["bottom"])
+        verdict = _verdict(s["top"], s["bottom"], min_base=min_base)
         summary = (f"Shorts: {verdict} — fastest {s['top']:.{decimals}f}{unit} vs "
                    f"slowest {s['bottom']:.{decimals}f}{unit} "
                    f"(based on {s['top_n']}+{s['bottom_n']} videos)")
+        if caveat:
+            summary += f" — {caveat}"
         return {"name": name, "cost": 0, "summary": summary, "result": res}
     return tool
 
@@ -712,17 +760,33 @@ def tool_cadence(ds):
         return {"name": "Upload cadence vs reach", "cost": 0,
                 "summary": "Run 'channel stats' fetch first (this tool needs it).",
                 "result": {}}
+    # Only rank channels that actually appear in THIS niche more than once. A non-endemic
+    # brand (e.g. a car company that sponsors esports) can match the query with ONE
+    # tangential video yet top the ranking on channel-wide reach — its 'views_per_month'
+    # is computed from its last ~50 uploads, which are off-topic. Requiring >=2 videos
+    # in-search keeps the headline to channels genuinely active in the niche.
+    MIN_APPEARANCES = 2
+    counts = Counter(v["channel"] for v in ds["videos"])
     seen = {}
     for v in ds["videos"]:
+        if counts[v["channel"]] < MIN_APPEARANCES:
+            continue
         seen[v["channel"]] = {
             "uploads_per_month": v.get("channel_uploads_per_month", 0),
             "avg_views": v.get("channel_avg_views", 0),
             "views_per_month": v.get("channel_views_per_month", 0),
+            "videos_in_search": counts[v["channel"]],
         }
     ranked = sorted(seen.items(), key=lambda kv: -kv[1]["views_per_month"])
+    if not ranked:
+        return {"name": "Upload cadence vs reach", "cost": 0,
+                "summary": ("No channel appears 2+ times in this niche yet — widen the "
+                            "search for a meaningful cadence ranking."),
+                "result": {"channels": []}}
     summary = (f"Top reach: {ranked[0][0]} "
                f"({ranked[0][1]['uploads_per_month']}/mo, "
-               f"{ranked[0][1]['views_per_month']:,} views/mo)" if ranked else "n/a")
+               f"{ranked[0][1]['views_per_month']:,} views/mo, "
+               f"{ranked[0][1]['videos_in_search']} videos here)")
     return {"name": "Upload cadence vs reach", "cost": 0,
             "summary": summary, "result": {"channels": ranked}}
 
@@ -803,9 +867,15 @@ def tool_charts(ds):
 
 def tool_channels(ds):
     """
-    For the channels in THIS search, show each channel's average views,
-    how many videos they had here, and how many of those beat their OWN
-    average (a consistency signal). Shorts and long-form kept separate.
+    For the channels in THIS search, show each channel's median views here and (if
+    channel stats were fetched) how many of those videos beat the channel's ALL-TIME
+    median — a real consistency signal. Shorts and long-form kept separate.
+
+    NOTE: counting videos above the median OF THE SAME videos is tautological (a median
+    splits its own set ~50/50 by definition), so that count carried no information. We
+    now compare against the channel's all-time median (channel_avg_views, pulled by
+    fetch_channel_stats). Without that fetch we simply omit the count rather than show a
+    number that always says "about half".
     """
     def grp(vids):
         by_chan = {}
@@ -817,9 +887,16 @@ def tool_channels(ds):
             n = len(cvids)
             # median is robust; for n==1 it's just that video (we label it honestly)
             typical = round(statistics.median(views))
-            # "beats typical" only meaningful with enough videos
-            above = sorted([v for v in cvids if v["views"] > statistics.median(views)],
-                           key=lambda v: -v["views"])
+            # Real bar = the channel's ALL-TIME median (same for every video of a channel,
+            # attached by fetch_channel_stats). None if channel stats weren't fetched.
+            alltime = next((v.get("channel_avg_views") for v in cvids
+                            if v.get("channel_avg_views")), None)
+            if alltime:
+                above = sorted([v for v in cvids if v["views"] > alltime],
+                               key=lambda v: -v["views"])
+                above_count = len(above)
+            else:
+                above, above_count = [], None        # no honest count without all-time data
             above_videos = [{
                 "title": v["title"],
                 "url": v.get("url", f"https://www.youtube.com/watch?v={v['id']}"),
@@ -827,7 +904,8 @@ def tool_channels(ds):
             } for v in above]
             rows.append({"channel": chan, "n": n, "typical_views": typical,
                          "single_video": n == 1,
-                         "above_count": len(above_videos),
+                         "alltime_median": round(alltime) if alltime else None,
+                         "above_count": above_count,
                          "above_videos": above_videos,
                          "all_videos": [{
                              "title": v["title"],
@@ -917,7 +995,7 @@ PURPOSES = {
     "duration": "Test whether video length (seconds) separates faster from slower videos.",
     "timing": "Surface which weekday the fastest videos tend to post on (qualitative).",
     "like_rate": "Test whether like-per-view separates faster from slower videos (suspected reach artifact).",
-    "comment_rate": "Test whether comment-per-view separates faster from slower videos.",
+    "comment_rate": "Test whether comment-per-view separates faster from slower videos (suspected reach artifact, like like-rate).",
     "breakouts": "Find videos that beat their channel's subscriber count the most (views/subs).",
     "chan_outlier": "Compare each video to its OWN channel's typical views (needs channel stats).",
     "cadence": "Relate a channel's upload frequency to its total reach (needs channel stats).",
@@ -1038,6 +1116,18 @@ minimum per-group sample it wants, then its result:
 
 Distribution data (from the charts):
 {distributions}
+
+CRITICAL — respect the tool's own verdict. Each signal line already contains the verdict \
+the tool computed from the data: "no clear difference", "winners higher", or "winners \
+lower". That verdict IS the ground truth. You must NOT upgrade a "no clear difference" to \
+a "real signal", "actionable", or "keep" — if the tool found no clear difference, the \
+honest read is noise / too-close-to-call, and you say so. A single run's gap that sits \
+near the threshold (e.g. emoji at 65% vs 51%) is exactly the kind of thing that flips \
+between runs; treat it as noise, not a trend. Only call something a real, actionable \
+signal when the tool itself reports a clear direction AND the per-group sample meets its \
+stated minimum. If your judgement genuinely differs from the tool's verdict, you may say \
+so, but you must explicitly flag that you are overriding the tool and give the concrete \
+statistical reason — never silently contradict it.
 
 Respond in markdown with EXACTLY these five sections:
 
@@ -1172,7 +1262,10 @@ TOOLS = {
                     "needs_channel_stats": False},
     "caps":        {"label": "ALL-CAPS / hype words", "cat": "Title",
                     "func": _numeric_tool("ALL-CAPS words",
-                                          lambda v: caps_words(v["title"])),
+                                          lambda v: caps_words(v["title"]),
+                                          caveat=("weak, Shorts-only signal — caps also "
+                                                  "show up in FAST long-form, so don't "
+                                                  "treat 'avoid caps' as a rule")),
                     "needs_channel_stats": False},
     "hook":        {"label": "Title hook (opening words)", "cat": "Title",
                     "func": tool_title_hook, "needs_channel_stats": False},
@@ -1188,7 +1281,7 @@ TOOLS = {
     "comment_rate": {"label": "Comment-per-view rate", "cat": "Engagement",
                      "func": _numeric_tool("Comment rate",
                                            lambda v: v["comment_rate"] * 100, "%",
-                                           decimals=3),
+                                           decimals=3, min_base=0.01),
                      "needs_channel_stats": False},
     "breakouts":   {"label": "Small-channel breakouts", "cat": "Channel",
                     "func": tool_small_breakouts, "needs_channel_stats": False},
