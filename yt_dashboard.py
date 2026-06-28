@@ -404,10 +404,38 @@ def per_format(videos, fn):
     return {"shorts": fn(shorts), "long": fn(longform)}
 
 
-def top_bottom(videos, metric="views_per_day", frac=0.33):
-    """Split a group into its top and bottom slice by a metric."""
-    ranked = sorted([v for v in videos if v.get(metric, 0) > 0],
-                    key=lambda v: v[metric], reverse=True)
+def _age_fair_scores(videos):
+    """Attach v['_pattern_score'] = each video's velocity ÷ its OWN age band's median
+    velocity, reusing the exact age-banding from the outliers tool. This is what makes
+    'fastest third vs slowest third' age-fair everywhere — without it, top_bottom ranks by
+    raw views/day and 'fast' silently means 'young' (a 2-day video almost always outranks a
+    60-day one regardless of quality). Returns the videos that have a usable score."""
+    band_median, _bands, _overall = _age_banded_baseline(videos)
+    scored = []
+    for v in videos:
+        bm = band_median(v)
+        if bm and v.get("views_per_day", 0) > 0:
+            v["_pattern_score"] = v["views_per_day"] / bm
+            scored.append(v)
+        else:
+            v["_pattern_score"] = 0
+    return scored
+
+
+def top_bottom(videos, metric="_pattern_score", frac=0.33):
+    """Split a group into its fastest and slowest slice.
+
+    By default we rank by '_pattern_score' — velocity relative to the video's OWN age band
+    (see _age_fair_scores) — NOT raw views/day. This stops the fast/slow split from being a
+    young/old split, which used to contaminate every pattern tool (duration, emoji, etc.):
+    fresh videos sit at peak velocity and would always land in 'fast'. Pass
+    metric='views_per_day' to force the old raw behaviour."""
+    if metric == "_pattern_score":
+        ranked = sorted(_age_fair_scores(videos),
+                        key=lambda v: v["_pattern_score"], reverse=True)
+    else:
+        ranked = sorted([v for v in videos if v.get(metric, 0) > 0],
+                        key=lambda v: v[metric], reverse=True)
     if len(ranked) < 4:
         return ranked, ranked       # too few to split meaningfully
     n = max(1, int(len(ranked) * frac))
@@ -421,6 +449,25 @@ def _frac(videos, pred):
 def _med(videos, fn):
     vals = [fn(v) for v in videos if fn(v) is not None]
     return statistics.median(vals) if vals else 0
+
+
+def channel_clustering(videos):
+    """How independent is this sample, really? The pattern tools treat every video as an
+    independent data point, but they cluster hard in a few prolific channels (one channel
+    can supply 20% of a search). Returns distinct channels, the top-5 share, and the Kish
+    effective sample size (Σnᵢ)²/Σnᵢ² — the number of *truly independent* observations the
+    data is worth. n=244 from a handful of channels can be worth an effective ~14."""
+    if not videos:
+        return {"videos": 0, "channels": 0, "top5_share": 0, "effective_n": 0}
+    counts = Counter(v["channel"] for v in videos)
+    sizes = list(counts.values())
+    total = sum(sizes)
+    top5 = sum(c for _, c in counts.most_common(5))
+    eff = (total ** 2) / sum(s * s for s in sizes) if sizes else 0
+    return {"videos": total, "channels": len(counts),
+            "top5_share": round(top5 / total, 2) if total else 0,
+            "effective_n": round(eff, 1),
+            "top_channels": counts.most_common(5)}
 
 
 def has_emoji(text):
@@ -504,6 +551,60 @@ def _vid_card(v, baseline=None):
     return card
 
 
+def _age_banded_baseline(vids):
+    """The age-fairness fix for velocity.
+
+    views/day = total_views / age_days ASSUMES a video gathers views at a constant rate.
+    It doesn't — YouTube views are heavily front-loaded, then decay. So an OLD video's
+    lifetime-average velocity sits far below the speed it actually had when fresh, while a
+    1-day-old video is measured at its peak. Pooling every age into one niche median
+    therefore does two bad things at once: decayed old videos DEFLATE the median, and
+    fresh videos look INFLATED against it (that's why a 36k-view fresh video could read
+    '43x' while an 800k-view older video read '23x').
+
+    Fix: compare each video only to videos of SIMILAR AGE. The front-loading bias is
+    roughly shared within an age band, so it cancels — a 40-day video that's 3x the
+    typical 40-day video really is 3x faster than its peers.
+
+    Returns (band_median_fn, bands, overall_median):
+      band_median_fn(video) -> the median velocity of the video's age band
+      bands -> list of {min_age, max_age, median, n} for display
+      overall_median -> the old single niche median (kept for the headline only)
+    Bands are equal-COUNT slices of the age-sorted pool (so none is ever too thin), and we
+    use 1 band per ~40 videos (max 5). Below ~40 videos it degrades to a single band,
+    i.e. the original whole-niche median — so small samples behave exactly as before.
+    """
+    pool = [v for v in vids
+            if v.get("views_per_day", 0) > 0 and v["views"] >= BASELINE_MIN_VIEWS]
+    if not pool:
+        pool = [v for v in vids if v.get("views_per_day", 0) > 0]
+    if not pool:
+        return (lambda v: 0), [], 0
+
+    overall = statistics.median(v["views_per_day"] for v in pool)
+    pool.sort(key=lambda v: v.get("age_days", 1))
+    n_bands = max(1, min(5, len(pool) // 40))
+    step = len(pool) / n_bands
+    bands = []
+    for i in range(n_bands):
+        chunk = pool[round(i * step):round((i + 1) * step)]
+        if not chunk:
+            continue
+        bands.append({"min_age": chunk[0].get("age_days", 1),
+                      "max_age": chunk[-1].get("age_days", 1),
+                      "median": statistics.median(v["views_per_day"] for v in chunk),
+                      "n": len(chunk)})
+
+    def band_median(v):
+        age = v.get("age_days", 1)
+        for b in bands:
+            if age <= b["max_age"]:
+                return b["median"]
+        return bands[-1]["median"] if bands else overall
+
+    return band_median, bands, overall
+
+
 def tool_outliers(ds):
     """
     Ranks videos by views-per-day (velocity) against each FORMAT's own median.
@@ -511,29 +612,26 @@ def tool_outliers(ds):
     low-velocity video may still beat its own channel, which we show too.
     """
     def grp(vids):
-        # Baseline = median velocity of REAL videos. Exclude near-dead ones (abandoned
-        # VODs with a handful of views) from the reference only — they still get scored
-        # against it and still appear in the lists. Fall back to all videos if the floor
-        # would empty the pool (tiny niche), so base is never 0 by accident.
-        pool = [v["views_per_day"] for v in vids
-                if v["views_per_day"] > 0 and v["views"] >= BASELINE_MIN_VIEWS]
-        if not pool:
-            pool = [v["views_per_day"] for v in vids if v["views_per_day"] > 0]
-        base = statistics.median(pool) if pool else 0
+        # Age-fair baseline: each video is scored against the median velocity of videos
+        # of SIMILAR AGE, not one whole-niche median (see _age_banded_baseline). The
+        # min-views floor still applies inside it so near-dead VODs don't pollute any band.
+        band_median, bands, overall = _age_banded_baseline(vids)
         for v in vids:
-            v["score"] = round(v["views_per_day"] / base, 2) if base else 0
+            bm = band_median(v)
+            v["score"] = round(v["views_per_day"] / bm, 2) if bm else 0
+            v["_band_baseline"] = round(bm) if bm else 0
         fast = sorted([v for v in vids if v["score"] >= 2], key=lambda v: -v["score"])
         slow = sorted([v for v in vids if 0 < v["score"] <= 0.5], key=lambda v: v["score"])
-        return {"baseline": round(base), "n": len(vids),
-                "fastest": [_vid_card(v, base) for v in fast],
-                "slowest": [_vid_card(v, base) for v in slow]}
+        return {"baseline": round(overall), "n": len(vids),
+                "n_bands": len(bands), "bands": bands,
+                "fastest": [_vid_card(v, v["_band_baseline"]) for v in fast],
+                "slowest": [_vid_card(v, v["_band_baseline"]) for v in slow]}
     res = per_format(ds["videos"], grp)
     s, l = res["shorts"], res["long"]
-    summary = (f"Shorts median {s['baseline']:,}/day "
-               f"({len(s['fastest'])} above 2×, {len(s['slowest'])} below 0.5×) · "
-               f"Long-form median {l['baseline']:,}/day "
-               f"({len(l['fastest'])} above 2×, {len(l['slowest'])} below 0.5×)")
-    return {"name": "Velocity outliers (views/day vs niche median)", "cost": 0,
+    summary = (f"Each video vs the typical video of similar age (fair to old & new). "
+               f"Shorts ~{s['baseline']:,}/day · {len(s['fastest'])} fast, {len(s['slowest'])} slow.  "
+               f"Long ~{l['baseline']:,}/day · {len(l['fastest'])} fast, {len(l['slowest'])} slow.")
+    return {"name": "Velocity outliers (views/day vs similar-age median)", "cost": 0,
             "summary": summary, "result": res}
 
 
@@ -561,14 +659,17 @@ def _presence_tool(name, pred):
     return tool
 
 
-def _numeric_tool(name, fn, unit="", decimals=1, min_base=1, caveat=""):
+def _numeric_tool(name, fn, unit="", decimals=1, min_base=1, caveat="", diagnostic=False):
     """Factory: median of a numeric trait in fastest vs slowest, with per-video values.
     'decimals' controls display precision — comment-rate needs more than 1 dp or it
     rounds to a useless 0.0% for every video.
     'min_base' is passed to _verdict; metrics with a tiny natural range (comment-rate)
     pass a small value so the verdict can actually see their differences.
     'caveat' is appended to the summary header for signals that are real but weak/
-    format-dependent, so the warning shows in the collapsed UI (not buried)."""
+    format-dependent, so the warning shows in the collapsed UI (not buried).
+    'diagnostic' marks reach artifacts (like/comment rate): we still SHOW the numbers but
+    drop the 'winners higher/lower' verdict, because it isn't a craft signal to optimise —
+    it tracks reach, and (comment-rate) even flips sign by format."""
     def tool(ds):
         def grp(vids):
             top, bot = top_bottom(vids)
@@ -583,10 +684,15 @@ def _numeric_tool(name, fn, unit="", decimals=1, min_base=1, caveat=""):
                     "top_items": items(top), "bottom_items": items(bot)}
         res = per_format(ds["videos"], grp)
         s = res["shorts"]
-        verdict = _verdict(s["top"], s["bottom"], min_base=min_base)
-        summary = (f"Shorts: {verdict} — fastest {s['top']:.{decimals}f}{unit} vs "
-                   f"slowest {s['bottom']:.{decimals}f}{unit} "
-                   f"(based on {s['top_n']}+{s['bottom_n']} videos)")
+        if diagnostic:
+            summary = (f"Diagnostic only (reach artifact — tracks reach, not craft; "
+                       f"don't optimise for it): fastest {s['top']:.{decimals}f}{unit} vs "
+                       f"slowest {s['bottom']:.{decimals}f}{unit}")
+        else:
+            verdict = _verdict(s["top"], s["bottom"], min_base=min_base)
+            summary = (f"Shorts: {verdict} — fastest {s['top']:.{decimals}f}{unit} vs "
+                       f"slowest {s['bottom']:.{decimals}f}{unit} "
+                       f"(based on {s['top_n']}+{s['bottom_n']} videos)")
         if caveat:
             summary += f" — {caveat}"
         return {"name": name, "cost": 0, "summary": summary, "result": res}
@@ -637,32 +743,63 @@ def tool_upload_timing(ds):
     return {"name": "Upload timing", "cost": 0, "summary": summary, "result": res}
 
 
+def _is_auto_channel(name):
+    """YouTube auto-generates '... - Topic' channels for music/art-tracks. They aren't
+    creators you can learn from, and their tiny sub counts blow up any views/subs ratio."""
+    return str(name).strip().endswith("- Topic")
+
+
 def tool_small_breakouts(ds):
-    """Videos that massively beat their channel's subscriber count."""
+    """Videos that massively beat their channel's subscriber count — a sign the IDEA
+    carried, not the existing audience. We drop auto-generated '- Topic' channels (not
+    real creators) and flag tiny-sub denominators, since views÷subs explodes mechanically
+    when subs are in the hundreds."""
     def grp(vids):
-        ranked = sorted([v for v in vids if v.get("views_per_sub", 0) > 0],
+        ranked = sorted([v for v in vids
+                         if v.get("views_per_sub", 0) > 0 and not _is_auto_channel(v.get("channel"))],
                         key=lambda v: -v["views_per_sub"])
+        for v in ranked:
+            v["small_denominator"] = v.get("subs", 0) < 1000
         return {"top": ranked[:8], "n": len(vids)}
     res = per_format(ds["videos"], grp)
     top = res["shorts"]["top"]
-    lead = f"{top[0]['views_per_sub']}x subs" if top else "n/a"
+    if top:
+        flag = " ⚠ tiny sub count — ratio is inflated" if top[0].get("small_denominator") else ""
+        lead = f"{top[0]['views_per_sub']}x subs{flag}"
+    else:
+        lead = "n/a"
     summary = f"Best small-channel Short breakout: {lead}"
     return {"name": "Small-channel breakouts", "cost": 0,
             "summary": summary, "result": res}
 
 
 def tool_saturation(ds):
-    """How crowded the niche is: channel concentration."""
+    """How crowded the niche is: channel concentration + how independent the sample is.
+
+    Concentration (distinct channels, top-5 share) is reported on the whole result set.
+    But the effective independent sample is reported PER FORMAT, because the pattern tools
+    run per format — and a channel that posts one Short and one Long would otherwise be
+    double-counted as two independent voices, inflating the pooled figure ~2x. This keeps
+    the visible number aligned with the per-format figure the AI reasons from."""
     vids = ds["videos"]
     chans = Counter(v["channel"] for v in vids)
     distinct = len(chans)
     top_share = chans.most_common(1)[0][1] / len(vids) if vids else 0
-    summary = (f"{distinct} distinct channels across {len(vids)} videos; "
-               f"top channel holds {top_share:.0%} of results")
+    pooled = channel_clustering(vids)
+    cl_s = channel_clustering([v for v in vids if v.get("is_short")])
+    cl_l = channel_clustering([v for v in vids if not v.get("is_short")])
+    summary = (f"{distinct} channels across {len(vids)} videos — but the top 5 hold "
+               f"{pooled['top5_share']:.0%} (top 1 = {top_share:.0%}). Effective independent "
+               f"sample (what per-video patterns really rest on): Shorts ≈ "
+               f"{cl_s['effective_n']:.0f}, Long ≈ {cl_l['effective_n']:.0f}. Treat "
+               f"per-video findings with that in mind, not the raw video count.")
     return {"name": "Niche saturation", "cost": 0, "summary": summary,
             "result": {"distinct_channels": distinct,
                        "top_channels": chans.most_common(5),
-                       "concentration": round(top_share, 2)}}
+                       "concentration": round(top_share, 2),
+                       "top5_share": pooled["top5_share"],
+                       "effective_n_shorts": cl_s["effective_n"],
+                       "effective_n_long": cl_l["effective_n"]}}
 
 
 def tool_language_split(ds):
@@ -678,8 +815,10 @@ def tool_language_split(ds):
                 for lang, vs in buckets.items()}
     res = per_format(ds["videos"], grp)
     langs = ", ".join(res["shorts"].keys())
-    summary = f"Shorts languages present: {langs}"
-    return {"name": "Language / region split", "cost": 0,
+    summary = (f"Title scripts present in Shorts: {langs}. (Detects SCRIPT only — Latin "
+               f"lumps English/Spanish/Portuguese/Polish together, so this is not a "
+               f"region or language read.)")
+    return {"name": "Title script split", "cost": 0,
             "summary": summary, "result": res}
 
 
@@ -783,10 +922,12 @@ def tool_cadence(ds):
                 "summary": ("No channel appears 2+ times in this niche yet — widen the "
                             "search for a meaningful cadence ranking."),
                 "result": {"channels": []}}
-    summary = (f"Top reach: {ranked[0][0]} "
+    summary = (f"Top reach (within this search): {ranked[0][0]} "
                f"({ranked[0][1]['uploads_per_month']}/mo, "
                f"{ranked[0][1]['views_per_month']:,} views/mo, "
-               f"{ranked[0][1]['videos_in_search']} videos here)")
+               f"{ranked[0][1]['videos_in_search']} of {len(ds['videos'])} videos here). "
+               f"Note: a channel that floods the search will top this — it's reach within "
+               f"these results, not proof high cadence causes high reach.")
     return {"name": "Upload cadence vs reach", "cost": 0,
             "summary": summary, "result": {"channels": ranked}}
 
@@ -985,7 +1126,7 @@ def _call_claude(prompt, max_tokens=1400):
 # What each tool is FOR — fed to the AI so it can judge whether a tool is working as
 # intended and whether it's even relevant for the niche, not just read its number.
 PURPOSES = {
-    "outliers": "Rank videos by velocity (views/day) vs the niche median to surface what's over/under-performing.",
+    "outliers": "Rank videos by velocity (views/day) vs the median of videos of SIMILAR AGE (age-adjusted, because raw views/day favours fresh videos) to surface what's over/under-performing.",
     "title_len": "Test whether title length (chars) separates faster from slower videos.",
     "emoji": "Test whether using emoji in the title separates faster from slower videos.",
     "question": "Test whether question-style titles separate faster from slower videos.",
@@ -1000,8 +1141,8 @@ PURPOSES = {
     "chan_outlier": "Compare each video to its OWN channel's typical views (needs channel stats).",
     "cadence": "Relate a channel's upload frequency to its total reach (needs channel stats).",
     "channels": "Per-channel median views in this niche + how many of its videos beat that median.",
-    "saturation": "Measure how concentrated the niche is (distinct channels, top channel's share).",
-    "language": "Split titles by script/language to reveal the regional mix in the results.",
+    "saturation": "Measure how concentrated the niche is: distinct channels, top-5 share, and the effective independent sample size (clustering-aware).",
+    "language": "Split titles by SCRIPT only (Latin/CJK/etc.) — NOT language or region; Latin lumps English/Spanish/Portuguese/Polish together.",
     "freshness": "Median video age — flags a trend spike when most videos are very recent.",
 }
 
@@ -1043,11 +1184,20 @@ def _fetch_diagnostics(ds):
         note = (f" NOTE: only {m['returned_total']} of ~{m['requested_total']} requested came "
                 f"back ({int(m['fill_ratio']*100)}%) — the search window may be too narrow or "
                 f"the niche too small for this window; the sample is supply-limited, not a bug.")
+    cl_s = channel_clustering([v for v in ds["videos"] if v.get("is_short")])
+    cl_l = channel_clustering([v for v in ds["videos"] if not v.get("is_short")])
+    cluster = (f" CLUSTERING (critical for reliability): Shorts come from {cl_s['channels']} "
+               f"channels, top 5 = {cl_s['top5_share']:.0%}, EFFECTIVE independent sample "
+               f"≈ {cl_s['effective_n']:.0f} (not {cl_s['videos']}). Long-form: "
+               f"{cl_l['channels']} channels, top 5 = {cl_l['top5_share']:.0%}, effective "
+               f"≈ {cl_l['effective_n']:.0f}. The per-video '% of fastest vs slowest' splits "
+               f"rest on these effective sizes, not the raw counts — weight your confidence "
+               f"accordingly and say so if the effective sample is small.")
     return (f"Fetch diagnostics: requested up to {m.get('requested_per_format')}/format; "
             f"returned {m.get('returned_total')} videos "
             f"({m.get('returned_shorts')} Shorts, {m.get('returned_long')} long-form); "
             f"window {w.get('after')}→{w.get('before') or 'today'}, region '{w.get('region')}'; "
-            f"spent {src}.{note}")
+            f"spent {src}.{note}{cluster}")
 
 
 def _corr(xs, ys):
@@ -1276,18 +1426,19 @@ TOOLS = {
     "timing":      {"label": "Upload timing (weekday)", "cat": "Video",
                     "func": tool_upload_timing, "needs_channel_stats": False},
     "like_rate":   {"label": "Like-per-view rate", "cat": "Engagement",
-                    "func": _numeric_tool("Like rate", lambda v: v["like_rate"] * 100, "%"),
+                    "func": _numeric_tool("Like rate", lambda v: v["like_rate"] * 100, "%",
+                                          diagnostic=True),
                     "needs_channel_stats": False},
     "comment_rate": {"label": "Comment-per-view rate", "cat": "Engagement",
                      "func": _numeric_tool("Comment rate",
                                            lambda v: v["comment_rate"] * 100, "%",
-                                           decimals=3, min_base=0.01),
+                                           decimals=3, min_base=0.01, diagnostic=True),
                      "needs_channel_stats": False},
     "breakouts":   {"label": "Small-channel breakouts", "cat": "Channel",
                     "func": tool_small_breakouts, "needs_channel_stats": False},
     "saturation":  {"label": "Niche saturation", "cat": "Niche",
                     "func": tool_saturation, "needs_channel_stats": False},
-    "language":    {"label": "Language / region split", "cat": "Niche",
+    "language":    {"label": "Title script split", "cat": "Niche",
                     "func": tool_language_split, "needs_channel_stats": False},
     "freshness":   {"label": "Niche freshness (trend-spike check)", "cat": "Niche",
                     "func": tool_freshness, "needs_channel_stats": False},

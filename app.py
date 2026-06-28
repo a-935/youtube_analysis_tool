@@ -110,7 +110,7 @@ def outlier_table(cards):
         vsb, base, vpd = c.get("vs_baseline"), c.get("baseline"), c.get("views_per_day")
         if vsb is not None and base:
             niche = tip(f"{vsb}×",
-                        f"{(vpd or 0):,.0f} views/day  ÷  niche median {base:,} views/day  =  {vsb}×")
+                        f"{(vpd or 0):,.0f} views/day  ÷  similar-age median {base:,} views/day  =  {vsb}×")
         else:
             niche = "—"
 
@@ -140,7 +140,7 @@ def outlier_table(cards):
         "<th style='padding:4px 8px;text-align:left'>Channel</th>"
         "<th style='padding:4px 8px;text-align:left'>Video</th>"
         "<th style='padding:4px 8px;text-align:right'>Views</th>"
-        "<th style='padding:4px 8px;text-align:right'>× niche median</th>"
+        "<th style='padding:4px 8px;text-align:right'>× similar-age median</th>"
         "<th style='padding:4px 8px;text-align:right'>× channel typical</th>"
         "<th style='padding:4px 8px;text-align:right'>Released</th>"
         "</tr></thead><tbody>"
@@ -291,7 +291,7 @@ if ca.button("Clear all", use_container_width=True):
 st.sidebar.caption("'Select all' skips the paid AI tools — tick those yourself.")
 
 TOOL_HELP = {
-    "outliers": "Ranks videos by views-per-day vs the niche median. Shows fastest/slowest per format.",
+    "outliers": "Ranks videos by views-per-day vs the median of videos of SIMILAR AGE (age-adjusted, since raw views/day favours brand-new videos). Shows fastest/slowest per format.",
     "title_len": "Compares title length (characters) of faster vs slower videos.",
     "emoji": "Whether faster videos use emoji more than slower ones.",
     "question": "Whether faster videos use question-style titles.",
@@ -302,9 +302,9 @@ TOOL_HELP = {
     "timing": "Which weekday the fastest videos tend to post on.",
     "like_rate": "Likes-per-view of faster vs slower videos. Reach artifact — slower/smaller videos draw MORE likes per view, so it's diagnostic, not a target to optimize.",
     "comment_rate": "Comments-per-view of faster vs slower videos. Reach artifact like like-rate — slower videos draw more comments per view. Diagnostic, not a target.",
-    "breakouts": "Videos that beat their channel's subscriber count the most (views/subs).",
+    "breakouts": "Videos that beat their channel's subscriber count the most (views/subs). Auto '- Topic' channels are filtered out; tiny-sub denominators get a warning.",
     "chan_outlier": "Each video vs its OWN channel average (needs channel-stats fetch).",
-    "cadence": "Upload frequency vs total reach per channel (needs channel-stats fetch).",
+    "cadence": "Upload frequency vs reach per channel (needs channel-stats fetch). Reach is within this search, so a channel that floods results will top it — labeled accordingly.",
     "channels": "Each channel's average views in this niche + how many of its videos beat that average.",
     "ai_summary": "Sends all the signals to Claude for a strategy brief, reliability check, and dev notes. Costs Claude credit.",
     "ai_ideas": "Asks Claude to pitch 5 ready-to-film video ideas built from what's winning in THIS niche. Costs Claude credit.",
@@ -398,8 +398,12 @@ with st.expander("📖 How to read this (plain-language guide)"):
 A video with 1,000 views in 2 days (500/day) is hotter right now than one with
 5,000 views over 100 days (50/day). We rank by this so today's trends rise to the top.
 
-**Niche median** — the *typical* video in your search. Everything is compared to it.
-"2× niche median" means twice as fast as the typical video here.
+**Similar-age median** — the *typical* video of about the same age as the one you're
+looking at. Velocity (views/day) naturally favours brand-new videos — a 1-day-old video
+is caught at its peak, while an old video's views/day is averaged across a long quiet
+tail. So instead of comparing every video to one niche-wide median, we compare each one
+to videos of *similar age*, which is a fair fight. "2× similar-age median" means twice as
+fast as the typical video of its age here.
 
 **× channel typical** — how much a video beat *its own channel's* normal (the channel's
 median views across its recent uploads). A video can be slow for the whole niche but
@@ -553,14 +557,22 @@ for key, out in R["outputs"]:
         elif key == "outliers":
             for fmt in ("shorts", "long"):
                 b = result.get(fmt, {})
-                st.markdown(f"**{fmt.title()}** — median {b.get('baseline', 0):,} views/day "
-                            f"(the reference all multipliers compare to)")
+                bands = b.get("bands", [])
+                st.markdown(f"**{fmt.title()}** — age-adjusted: each video is compared to "
+                            f"the typical video of *similar age*, not one niche median "
+                            f"(raw views/day unfairly favours brand-new videos). "
+                            f"Overall ~{b.get('baseline', 0):,} views/day.")
+                if len(bands) > 1:
+                    band_txt = " · ".join(
+                        f"{bd['min_age']}–{bd['max_age']}d: {round(bd['median']):,}/day "
+                        f"(n={bd['n']})" for bd in bands)
+                    st.caption(f"Age bands (the bar each multiplier uses): {band_txt}")
                 if b.get("fastest"):
-                    st.markdown("Fastest (2×+ the median):")
+                    st.markdown("Fastest (2×+ their similar-age median):")
                     st.markdown(outlier_table(b["fastest"][:8]), unsafe_allow_html=True)
                 if b.get("slowest"):
-                    st.markdown("Slowest (below 0.5× median) — a 'slow' video may still "
-                                "beat its own channel (see × channel typical):")
+                    st.markdown("Slowest (below 0.5× their similar-age median) — a 'slow' "
+                                "video may still beat its own channel (see × channel typical):")
                     st.markdown(outlier_table(b["slowest"][:8]), unsafe_allow_html=True)
 
         elif key == "channels":
