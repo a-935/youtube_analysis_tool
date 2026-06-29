@@ -64,11 +64,11 @@ TOOLS = [
     ("video", "🎬", "Analyse a Specific Video",
      "Deep-dive one video: age-fair stats vs its niche, transcript, AI-nominated "
      "Short clips, and advertiser-friendliness hints.",
-     tool_video.render, False),
+     tool_video.render, True),
     ("trends", "📈", "Trend Discovery",
      "What's rising across genres right now — velocity-ranked emerging topics, "
      "clustered into trends, with saturation and opportunity reads.",
-     tool_trends.render, False),
+     tool_trends.render, True),
 ]
 TOOLS_BY_ID = {t[0]: t for t in TOOLS}
 
@@ -110,8 +110,8 @@ def render_landing():
                                    "and what's honestly possible.")
 
     st.markdown("---")
-    st.caption("v4 · Phase 1 (app shell). Tools 2 and 3 are scaffolds for now — "
-               "see Niche_Research_Expansion_Plan.md for the build order.")
+    st.caption("v4 · all three tools live. Tool 1 saves runs to the archive; "
+               "cross-run meta-analysis tells real signals from noise over time.")
 
 
 def render_tool(tool_id):

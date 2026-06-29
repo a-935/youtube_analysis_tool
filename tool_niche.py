@@ -16,6 +16,10 @@ from datetime import date, timedelta
 
 import streamlit as st
 import yt_dashboard as engine
+import storage
+import archive
+import meta_analysis as meta_an
+import exports
 
 try:
     import pandas as pd
@@ -185,6 +189,112 @@ def render_pattern(result, value_header):
             st.markdown(pattern_table(bot[:6], value_header))
 
 
+def render_archive_panel():
+    """The Summary Archive + cross-run meta-analysis (Expansion Plan §2b).
+    Cross-run replication is the validity test: a signal that points the same way
+    across many runs is real; one that flips is noise."""
+    try:
+        runs = storage.list_runs(limit=500)
+    except Exception as ex:
+        st.caption(f"Archive unavailable: {ex}")
+        return
+
+    with st.expander(f"📚 Archive & cross-run meta-analysis ({len(runs)} saved runs)"):
+        if not runs:
+            st.info("No saved runs yet. Run an analysis with 'Save run to archive' "
+                    "ticked, a few times across days/niches, then come back — "
+                    "replication across runs is the cleanest validity test.")
+            return
+
+        topics = storage.distinct_topics()
+        st.caption("Saved runs by topic: " +
+                   ", ".join(f"{t}×{c}" for t, c in topics))
+
+        # ---- Signal replication scoreboard (the headline) ----
+        board = meta_an.replication_scoreboard(runs)
+        st.markdown("**Signal replication scoreboard** — does each signal point the "
+                    "same way across runs? ROBUST = holds up; NOISE = flips; "
+                    "THIN = too few runs yet.")
+        if board:
+            rows = [{"Signal": s["signal"], "Verdict": s["classification"],
+                     "Direction": s["dominant"], "Agreement": f"{s['agreement']:.0%}",
+                     "Runs": s["runs_seen"], "↑": s["higher"], "↓": s["lower"],
+                     "~": s["none"]} for s in board]
+            if pd is not None:
+                st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+            else:
+                st.markdown(exports.scoreboard_to_markdown(board))
+        else:
+            st.caption("No directional signals stored yet.")
+
+        # ---- Regime-change flags ----
+        flags = meta_an.regime_change_flags(runs)
+        if flags:
+            st.warning("⚠ Regime change — these were robust but are now flipping in "
+                       "recent runs: " +
+                       "; ".join(f"{f['signal']} ({f['was']} → {f['now']})" for f in flags))
+
+        # ---- Niche-over-time ----
+        topic_list = [t for t, _ in topics]
+        pick = st.selectbox("Track one niche over time", topic_list, key="meta_topic")
+        series = meta_an.niche_over_time(runs, topic=pick)
+        if pd is not None and len(series) >= 2:
+            df = pd.DataFrame([{
+                "run": s["ts"][:10],
+                "median velocity (Shorts)": s["median_velocity_short"],
+                "median velocity (long)": s["median_velocity_long"],
+                "effective-n (Shorts)": s["effective_n_short"],
+            } for s in series]).set_index("run")
+            st.line_chart(df)
+            newest = series[-1]
+            if newest["new_channels"]:
+                st.caption("New outlier channels in the latest run: " +
+                           ", ".join(newest["new_channels"][:8]))
+        else:
+            st.caption("Need ≥2 runs of this niche for a trend line.")
+
+        # ---- Channel watch + cost ----
+        watch = meta_an.channel_watch(runs)
+        if watch:
+            st.markdown("**Channel watch** — recurring outlier channels (rising stars):")
+            st.markdown("\n".join(
+                f"- {w['channel']} — {w['appearances']} runs "
+                f"({', '.join(w['niches'][:4])})" for w in watch[:10]))
+
+        cost = meta_an.cost_summary(runs)
+        st.caption(f"💰 Across {cost['runs']} runs: {cost['total_quota']:,} quota units, "
+                   f"${cost['total_claude_usd']:.4f} Claude. "
+                   f"Avg/run: {cost['avg_quota_per_run']:.0f} units, "
+                   f"${cost['avg_claude_per_run']:.4f}.")
+
+        # ---- Cross-niche universals ----
+        uni = meta_an.cross_niche_universals(runs)
+        multi = [u for u in uni if u["topics"] >= 2]
+        if multi:
+            st.markdown("**Cross-niche** — what holds everywhere vs one game:")
+            st.markdown("\n".join(f"- {u['signal']}: {u['verdict']}" for u in multi[:8]))
+
+        # ---- Exports + AI meta-brief ----
+        c1, c2 = st.columns(2)
+        c1.download_button("⬇ Scoreboard (Markdown)",
+                           exports.scoreboard_to_markdown(board),
+                           file_name="replication_scoreboard.md",
+                           use_container_width=True, disabled=not board)
+        if c2.button("🧠 AI meta-brief (Claude)", use_container_width=True,
+                     help="Feeds the replication scoreboard to Claude for a holistic, "
+                          "cross-run read. Costs a little Claude credit."):
+            with st.spinner("Asking Claude for the cross-run read..."):
+                try:
+                    prompt = meta_an.build_meta_prompt(runs, board)
+                    res = engine._call_claude(prompt, max_tokens=1200)
+                    st.session_state.claude_used += res.get("cost_usd", 0) or 0
+                    st.session_state.meta_brief = res["text"]
+                except Exception as ex:
+                    st.session_state.meta_brief = f"Claude call failed: {ex}"
+        if st.session_state.get("meta_brief"):
+            st.markdown(st.session_state.meta_brief)
+
+
 def render():
     if not os.environ.get("YT_KEY"):
         st.sidebar.error("No YouTube key. Add YT_KEY=... to your .env")
@@ -262,6 +372,11 @@ def render():
     drop_official = st.sidebar.checkbox(
         "Exclude official/brand channel", value=True,
         help="Drops the game's own channel (e.g. 'Call of Duty') so trailers don't skew results.")
+
+    save_to_archive = st.sidebar.checkbox(
+        "Save run to archive", value=True,
+        help="Persists this run (signals, metrics, AI brief) so cross-run "
+             "meta-analysis can tell real signals from noise over time.")
 
     # live cost estimate
     pages = max(1, (per_format + 49) // 50)
@@ -382,6 +497,26 @@ def render():
             "outputs": outputs,
         }
 
+        # ---- Archive the run (Expansion Plan §2a) ----
+        # Persist signals/metrics/AI brief so cross-run replication can run later.
+        st.session_state.last_saved_run = None
+        if save_to_archive:
+            try:
+                ai_brief = next((o.get("result", {}).get("text", "")
+                                 for k, o in outputs if k == "ai_summary"), "")
+                claude_cost = sum((o.get("claude_cost_usd", 0) or 0) for _, o in outputs)
+                rec = archive.build_run_record(
+                    topic, region_label,
+                    {"after": after.isoformat() if after else None,
+                     "before": before.isoformat() if before else None,
+                     "age_days": int(age) if to_is_today else None,
+                     "tier": tier, "per_format": per_format},
+                    ds, outputs, ai_brief=ai_brief,
+                    quota_spent=spent, claude_cost=claude_cost)
+                st.session_state.last_saved_run = storage.save_run(rec)
+            except Exception as ex:
+                st.session_state.archive_error = str(ex)
+
 
     # ---------------- HEADER + WALLET ----------------
     st.title("YouTube Niche Research")
@@ -426,6 +561,10 @@ def render():
     m1, m2 = st.columns(2)
     m1.metric("Quota used (this session)", f"{st.session_state.quota_used:,} units")
     m2.metric("Claude credit used (this session)", f"${st.session_state.claude_used:.4f}")
+
+    if st.session_state.get("last_saved_run"):
+        st.caption(f"💾 Saved this run to the archive (#{st.session_state.last_saved_run}).")
+    render_archive_panel()
 
     R = st.session_state.results
     if not R:
