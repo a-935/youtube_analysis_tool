@@ -1,0 +1,1 @@
+Streamlit app for YouTube niche research. Three tools — niche/genre analysis, single-video teardowns (transcript, AI clip nomination, audience-flagged moments), and trend discovery — all built on an age-fair velocity engine that compares videos within age bands so old-vs-new is a fair fight.
