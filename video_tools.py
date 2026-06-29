@@ -431,9 +431,9 @@ def summarize_video(video, transcript_text, mined_desc):
 
 
 # ----------------------------------------------------------------- AI prompts
-def build_clip_prompt(video_meta, segments):
-    """Prompt to nominate Short-worthy clips from transcript content. The honesty label
-    is part of the instruction so the model never claims retention data (§3c)."""
+def build_clip_prompt(video_meta, segments, moments=None):
+    """Prompt to nominate Short-worthy clips, rate each clip's Short potential, and cross-
+    reference what the AUDIENCE already flagged (safest bets). Honesty label kept (§3c)."""
     lines = []
     for s in (segments or []):
         start = int(s.get("start") or 0)
@@ -441,20 +441,26 @@ def build_clip_prompt(video_meta, segments):
         lines.append(f"[{mm:02d}:{ss:02d}] {(s.get('text') or '').strip()}")
     body = "\n".join(lines)[:12000]   # keep prompt bounded
     title = video_meta.get("title", "(unknown)")
+    flagged = ""
+    if moments:
+        ts = ", ".join(f"{m['t']} (×{m['mentions']})" for m in moments[:10])
+        flagged = (f"\nThe AUDIENCE already quoted these timestamps in comments — clips "
+                   f"covering them are the SAFEST Short bets: {ts}\n")
     return f"""You are a short-form editor. Below is the TIMESTAMPED TRANSCRIPT of a \
-YouTube video titled "{title}". Nominate 3-6 candidate moments that could become Shorts.
+YouTube video titled "{title}". Nominate 4-7 candidate moments that could become Shorts.
 
-You do NOT have audience-retention or "most replayed" data — judge ONLY from the content \
+You do NOT have audience-retention or "most replayed" data — judge from the content \
 (a strong hook, a payoff, a funny or surprising beat, a self-contained moment).
-
+{flagged}
 Transcript:
 {body}
 
-Respond in markdown, one bullet per clip, each as:
-- **start–end (mm:ss)** — one line why it works; suggested Short title; "self-contained" \
-or "needs setup".
-Begin every response by stating these are suggested from transcript content, not from \
-audience-retention data."""
+Respond in markdown, one bullet per clip, EXACTLY in this shape:
+- **start–end (mm:ss, ~N sec)** — **Short potential: High/Medium/Low** — one line why it \
+works; suggested Short title; "self-contained" or "needs setup"; add "🔥 audience-flagged" \
+if it overlaps an audience-quoted timestamp above.
+Begin by stating these are suggested from transcript content, not audience-retention data. \
+End with one line: which single clip is the best Short to make first, and why."""
 
 
 def build_comment_prompt(comments, title="(unknown)"):
@@ -551,13 +557,13 @@ def fetch_transcript(video_id, db_path=None):
     return result
 
 
-def nominate_clips(video_meta, segments):
+def nominate_clips(video_meta, segments, moments=None):
     """LIVE (Claude). Returns {text, cost_usd} or {error}."""
     if not segments:
         return {"error": "No transcript — cannot nominate clips."}
-    prompt = build_clip_prompt(video_meta, segments)
+    prompt = build_clip_prompt(video_meta, segments, moments)
     try:
-        res = engine._call_claude(prompt, max_tokens=1200)
+        res = engine._call_claude(prompt, max_tokens=1300)
         return {"text": res["text"], "cost_usd": res["cost_usd"]}
     except Exception as e:
         return {"error": str(e)}

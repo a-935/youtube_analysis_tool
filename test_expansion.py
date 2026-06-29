@@ -202,8 +202,12 @@ def test_video_pure():
        all("score" not in w or True for w in winners))
 
     clip_prompt = vt.build_clip_prompt({"title": "RL montage"}, segs)
-    ok("clip prompt forbids retention claim", "not from audience-retention" in clip_prompt.lower()
-       or "not from audience" in clip_prompt.lower())
+    ok("clip prompt forbids retention claim", "not audience-retention" in clip_prompt.lower())
+    ok("clip prompt asks for Short potential", "short potential" in clip_prompt.lower())
+    clip_prompt2 = vt.build_clip_prompt({"title": "X"}, segs,
+                                        [{"t": "1:48", "mentions": 3}])
+    ok("clip prompt uses audience-flagged moments", "1:48" in clip_prompt2 and
+       "safest short bets" in clip_prompt2.lower())
     cprompt = vt.build_comment_prompt(["love it", "too long"], "RL montage")
     ok("comment prompt clusters themes", "what landed" in cprompt.lower())
 
