@@ -134,17 +134,60 @@ def render():
 
     # ---- Transcript-derived ----
     tr = R["transcript"]
-    with st.expander("🎙 Transcript-derived reads"):
+    with st.expander("🎙 Transcript-derived reads",
+                     expanded=not tr.get("available")):
         if not tr.get("available"):
             st.info(tr.get("reason") or "No transcript available.")
+            st.markdown("**Paste it manually instead** — copy the transcript from "
+                        "YouTube (the ⋯ menu → *Show transcript*) and drop it below. "
+                        "Timestamps are kept if present; plain text works too.")
         else:
-            wpm = vt.transcript_wpm(tr["segments"])
-            hook = vt.opening_hook(tr["segments"], 10)
-            st.markdown(f"**Pacing proxy:** ~{wpm} words/min "
-                        f"*(from transcript text — a proxy, NOT a measure of editing "
-                        f"pace or cut frequency, which the API can't give).*")
-            if hook:
-                st.markdown(f"**Spoken hook (first 10s):** “{hook}”")
+            src = tr.get("source")
+            st.caption("Using your pasted transcript." if src == "manual"
+                       else "Auto-fetched transcript. You can override it below.")
+
+        with st.form(key="paste_form", clear_on_submit=False):
+            pasted = st.text_area(
+                "Paste transcript", height=160,
+                placeholder="0:00 what is going on guys\n0:04 today we hit insane shots\n…",
+                label_visibility="collapsed")
+            submitted = st.form_submit_button("Use this transcript")
+        if submitted and pasted.strip():
+            parsed = vt.parse_pasted_transcript(pasted)
+            new_tr = {"available": True, "source": "manual",
+                      "segments": parsed["segments"], "text": parsed["text"],
+                      "has_timestamps": parsed["has_timestamps"]}
+            R["transcript"] = new_tr
+            st.session_state.video_result = R
+            try:    # cache it so you never paste twice for this video
+                import storage
+                storage.cache_transcript(video["id"], True, "manual",
+                                         parsed["text"], parsed["segments"])
+            except Exception:
+                pass
+            st.session_state.pop("clips", None)   # stale clips for old transcript
+            st.rerun()
+
+        tr = R["transcript"]
+        if tr.get("available"):
+            segs = tr["segments"]
+            has_ts = tr.get("has_timestamps",
+                            any((s.get("start") or 0) > 0 for s in segs))
+            st.markdown("---")
+            if has_ts:
+                wpm = vt.transcript_wpm(segs)
+                hook = vt.opening_hook(segs, 10)
+                st.markdown(f"**Pacing proxy:** ~{wpm} words/min "
+                            f"*(from transcript text — a proxy, NOT a measure of editing "
+                            f"pace or cut frequency, which the API can't give).*")
+                if hook:
+                    st.markdown(f"**Spoken hook (first 10s):** “{hook}”")
+            else:
+                first_words = " ".join(tr["text"].split()[:30])
+                st.caption("No timestamps in this transcript, so words/min and the "
+                           "'first 10 seconds' hook aren't available.")
+                if first_words:
+                    st.markdown(f"**Opening (first ~30 words):** “{first_words}…”")
 
             # risk hints — explicitly framed
             risk = vt.risk_hints(tr["text"])

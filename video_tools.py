@@ -132,6 +132,67 @@ def opening_hook(segments, seconds=10):
     return " ".join(out).strip()
 
 
+def parse_pasted_transcript(text):
+    """Turn a MANUALLY PASTED transcript into the same segment shape the API returns,
+    so every downstream feature (wpm, hook, risk, clips) works identically.
+
+    Handles the two shapes people actually paste:
+      A) YouTube 'Show transcript' — a timestamp then its line, e.g. '0:05 some text'
+         or the timestamp on its own line with text on the next.
+      B) Plain text with no timestamps — kept as one block (start=0); time-based
+         reads (wpm, 'first 10s') are then unavailable and the UI says so.
+
+    Returns {segments, text, has_timestamps}. Durations are estimated from the gap to
+    the next timestamp so transcript_wpm has a sensible total length.
+    """
+    text = (text or "").strip()
+    if not text:
+        return {"segments": [], "text": "", "has_timestamps": False}
+
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    ts_re = re.compile(r"^\(?(\d{1,2}:\d{2}(?::\d{2})?)\)?\s*(.*)$")
+    segments, pending = [], None
+    for ln in lines:
+        m = ts_re.match(ln)
+        if m and m.group(1):
+            secs = _ts_to_seconds(m.group(1))
+            rest = m.group(2).strip()
+            if rest:
+                segments.append({"start": secs, "text": rest, "duration": 0})
+            else:
+                pending = secs
+        elif pending is not None:
+            segments.append({"start": pending, "text": ln, "duration": 0})
+            pending = None
+        elif segments and segments[-1]["start"] == 0 and not _has_ts(segments):
+            segments[-1]["text"] += " " + ln      # continuation of plain text
+        elif segments:
+            segments[-1]["text"] += " " + ln      # wrapped line under last timestamp
+        else:
+            segments.append({"start": 0, "text": ln, "duration": 0})
+
+    has_ts = _has_ts(segments)
+    if not has_ts:
+        # collapse to a single block so wpm/hook can clearly report "no timing"
+        joined = " ".join(s["text"] for s in segments).strip()
+        segments = [{"start": 0, "text": joined, "duration": 0}]
+    else:
+        # estimate each segment's duration from the gap to the next start
+        for i in range(len(segments) - 1):
+            gap = segments[i + 1]["start"] - segments[i]["start"]
+            segments[i]["duration"] = max(gap, 0.5)
+        words_last = len(segments[-1]["text"].split())
+        segments[-1]["duration"] = max(2.0, words_last / 2.5)  # ~150 wpm guess
+
+    return {"segments": segments,
+            "text": " ".join(s["text"] for s in segments).strip(),
+            "has_timestamps": has_ts}
+
+
+def _has_ts(segments):
+    return any((s.get("start") or 0) > 0 for s in segments)
+
+
 # ----------------------------------------------------------------- risk hints (TEXT only)
 # Advertiser-friendliness HINTS from transcript text. This is NOT Content ID and NOT
 # a copyright/strike predictor (§3d). Common profanity only (for the yellow-icon hint);

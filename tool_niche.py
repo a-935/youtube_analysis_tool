@@ -274,6 +274,51 @@ def render_archive_panel():
             st.markdown("**Cross-niche** — what holds everywhere vs one game:")
             st.markdown("\n".join(f"- {u['signal']}: {u['verdict']}" for u in multi[:8]))
 
+        # ---- Saved-runs browser (view / note / export / delete) ----
+        st.markdown("---")
+        st.markdown("**Saved runs**")
+        labels = {f"#{r['id']} · {r.get('topic','?')} · {str(r.get('ts',''))[:16]} · "
+                  f"{r.get('n_videos','?')} vids": r for r in runs}
+        pick_run = st.selectbox("Open a saved run", list(labels.keys()), key="run_browse")
+        chosen = labels.get(pick_run)
+        if chosen:
+            note = st.text_input("Note", value=chosen.get("note", ""), key="run_note")
+            b1, b2, b3 = st.columns(3)
+            if b1.button("Save note", use_container_width=True):
+                storage.set_run_note(chosen["id"], note)
+                st.success("Note saved.")
+            b2.download_button("⬇ This run (Markdown)",
+                               exports.run_to_markdown(chosen),
+                               file_name=f"run_{chosen['id']}.md",
+                               use_container_width=True)
+            if b3.button("🗑 Delete run", use_container_width=True):
+                storage.delete_run(chosen["id"])
+                st.warning(f"Deleted run #{chosen['id']}. Reopen the panel to refresh.")
+            if chosen.get("ai_brief"):
+                with st.expander("AI brief from that run"):
+                    st.markdown(chosen["ai_brief"])
+
+        # ---- Compare two runs of the same niche (diff_runs) ----
+        same_topic = [r for r in runs if r.get("topic") == (chosen or {}).get("topic")]
+        if len(same_topic) >= 2:
+            st.markdown(f"**Compare two '{chosen['topic']}' runs** — what changed:")
+            opts = {f"#{r['id']} · {str(r.get('ts',''))[:16]}": r for r in same_topic}
+            ok_ = list(opts.keys())
+            cc1, cc2 = st.columns(2)
+            older = cc1.selectbox("Older", ok_, index=min(1, len(ok_) - 1), key="diff_old")
+            newer = cc2.selectbox("Newer", ok_, index=0, key="diff_new")
+            if st.button("Compare runs"):
+                d = meta_an.diff_runs(opts[older], opts[newer])
+                if d["flips"]:
+                    st.markdown("Signals that flipped:")
+                    for f in d["flips"]:
+                        st.markdown(f"- **{f['signal']}**: {f['was']} → {f['now']}")
+                else:
+                    st.caption("No signal verdicts changed.")
+                if d["deltas"]:
+                    st.markdown("Metric deltas (newer − older): " +
+                                ", ".join(f"{k} {v:+}" for k, v in d["deltas"].items()))
+
         # ---- Exports + AI meta-brief ----
         c1, c2 = st.columns(2)
         c1.download_button("⬇ Scoreboard (Markdown)",

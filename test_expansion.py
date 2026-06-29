@@ -217,6 +217,30 @@ def test_video_pure():
             if os.path.exists(p):
                 os.remove(p)
 
+    # manual paste — timestamped (YouTube 'Show transcript' shape)
+    pasted_ts = "0:00 what is going on guys\n0:03 today we hit insane shots\n1:05 lets go"
+    p1 = vt.parse_pasted_transcript(pasted_ts)
+    ok("paste: timestamps detected", p1["has_timestamps"] is True)
+    ok("paste: segments built", len(p1["segments"]) == 3 and p1["segments"][1]["start"] == 3)
+    ok("paste: durations estimated", p1["segments"][0]["duration"] >= 0.5)
+    ok("paste: wpm works on pasted ts", vt.transcript_wpm(p1["segments"]) and
+       vt.transcript_wpm(p1["segments"]) > 0)
+    ok("paste: hook works on pasted ts",
+       "insane shots" in vt.opening_hook(p1["segments"], 10))
+
+    # manual paste — timestamp on its own line, text on the next
+    pasted_split = "0:00\nhello there\n0:04\nwelcome back"
+    p2 = vt.parse_pasted_transcript(pasted_split)
+    ok("paste: split-line shape", p2["has_timestamps"] and
+       any("welcome back" in s["text"] for s in p2["segments"]))
+
+    # manual paste — plain text, no timestamps
+    p3 = vt.parse_pasted_transcript("hey everyone welcome to the video lets get into it")
+    ok("paste: plain text -> single block", p3["has_timestamps"] is False and
+       len(p3["segments"]) == 1)
+    ok("paste: plain text usable by risk/clips", "welcome" in p3["text"])
+    ok("paste: empty -> empty", vt.parse_pasted_transcript("")["segments"] == [])
+
 
 # ---------------------------------------------------------------- trends (pure)
 def test_trends():

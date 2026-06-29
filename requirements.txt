@@ -1,11 +1,11 @@
-# YouTube Niche Research — third-party dependencies
-# (everything else used — os, re, json, statistics, collections, datetime, html — is
-#  in the Python standard library and needs no install.)
-#
-# For exact pinned versions matching YOUR machine, run in the PyCharm terminal:
-#     pip freeze > requirements.txt
-# and commit the result. The unpinned list below is enough to get running.
-
-streamlit>=1.30
+# Core
+streamlit>=1.40
 requests>=2.31
 pandas>=2.0
+
+# Tool 2 transcripts (optional but recommended — without it, use the manual
+# paste box in "Analyse a Specific Video"). Sometimes IP-blocked on cloud hosts;
+# usually fine from a home machine.
+youtube-transcript-api>=0.6.2
+
+# storage.py uses sqlite3, which ships with Python — no install needed.
