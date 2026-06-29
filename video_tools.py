@@ -271,6 +271,165 @@ def similar_winners(peers, video, k=8):
     return out
 
 
+def place_vs_channel(video, channel_videos):
+    """The comparison that actually means something: is this a hit FOR THIS CHANNEL?
+    Compares the video against the channel's OWN recent videos (age-fair), which
+    controls for channel size — unlike comparing a huge channel to random niche videos.
+    """
+    pool = [v for v in channel_videos if v.get("id") != video.get("id")]
+    if not pool:
+        return None
+    full = pool + [video]
+    band_median, bands, overall = engine._age_banded_baseline(full)
+    bm = band_median(video)
+    vpd = video.get("views_per_day") or 0
+    return {
+        "vs_channel_typical": round(vpd / bm, 2) if bm else None,
+        "channel_median_vpd": round(bm) if bm else None,
+        "n_channel_videos": len(pool),
+        "channel": video.get("channel"),
+    }
+
+
+_CMT_TS = re.compile(r"\b(\d{1,2}:\d{2}(?::\d{2})?)\b")
+
+
+def mine_comment_moments(comments, top=8):
+    """The closest honest thing to retention data: which timestamps does the AUDIENCE
+    keep pointing at in the comments? People quote the best bits ('19:35 was gold').
+    Returns moments sorted by how many comments cite them. PURE."""
+    from collections import defaultdict
+    hits = defaultdict(list)
+    for c in (comments or []):
+        for m in _CMT_TS.findall(c or ""):
+            parts = [int(p) for p in m.split(":")]
+            secs = parts[0] * 60 + parts[1] if len(parts) == 2 else \
+                parts[0] * 3600 + parts[1] * 60 + parts[2]
+            snippet = (c or "").strip().replace("\n", " ")
+            hits[(m, secs)].append(snippet[:140])
+    moments = [{"t": t, "seconds": s, "mentions": len(v), "sample": v[0]}
+               for (t, s), v in hits.items()]
+    moments.sort(key=lambda x: (-x["mentions"], x["seconds"]))
+    return moments[:top]
+
+
+def analyze_title(video, winners):
+    """Light, honest title read vs the niche winners (titles drive clicks). PURE."""
+    title = video.get("title") or ""
+    words = title.split()
+    win_lens = [len((w.get("title") or "").split()) for w in (winners or [])
+                if w.get("title")]
+    import statistics as _s
+    win_median = round(_s.median(win_lens)) if win_lens else None
+    return {
+        "word_count": len(words),
+        "char_count": len(title),
+        "has_number": any(ch.isdigit() for ch in title),
+        "is_question": "?" in title,
+        "has_allcaps_word": any(w.isupper() and len(w) > 2 for w in words),
+        "winners_median_words": win_median,
+        "vs_winners": (None if win_median is None else
+                       ("shorter than" if len(words) < win_median
+                        else "longer than" if len(words) > win_median
+                        else "same length as")),
+    }
+
+
+def build_teardown_prompt(video, mined_desc, hook, comment_moments,
+                          comment_themes, winners, user_niche=""):
+    """The synthesis that makes the tool useful: tie every signal into 'why this worked
+    and what to STEAL for your content'. PURE (builds the prompt)."""
+    win = "\n".join(f"- {w.get('title','')} ({w.get('age_fair_score','?')}× age-fair)"
+                    for w in (winners or [])[:6]) or "(none)"
+    moments = "\n".join(f"- {m['t']} (cited by {m['mentions']} comments): {m['sample']}"
+                        for m in (comment_moments or [])[:6]) or "(none found)"
+    chapters = "\n".join(f"- {c['t']} {c['label']}" for c in
+                         (mined_desc or {}).get("chapters", [])[:15]) or "(none)"
+    niche_line = (f"The viewer makes content about: {user_niche}. Tailor every 'steal "
+                  f"this' point to THAT niche.\n" if user_niche.strip() else "")
+    return f"""You are a sharp YouTube strategist. Analyse why this video performs and what \
+a creator should STEAL from it. Be concrete and specific — no generic advice.
+
+{niche_line}
+VIDEO: "{video.get('title')}" by {video.get('channel')}
+Performance: {video.get('views', 0):,} views, {video.get('views_per_day', 0):,}/day, \
+{video.get('age_days', 0)} days old.
+
+Opening hook (spoken, first ~10s): "{hook[:400]}"
+
+Creator's own chapter structure:
+{chapters}
+
+Moments the AUDIENCE flagged in comments (closest thing to retention data):
+{moments}
+
+What comments said landed/missed:
+{(comment_themes or '(not analysed)')[:1500]}
+
+Age-fair top performers in the same lane:
+{win}
+
+Respond in markdown, tight and actionable:
+## Why it works
+3-4 bullets — the actual mechanics (hook, structure, pacing, topic choice).
+## Steal this
+3-5 concrete moves the viewer should copy{', applied to their niche' if user_niche.strip() else ''}.
+## Title & packaging
+One line on the title/structure pattern worth reusing.
+Keep it under 250 words. No fluff."""
+
+
+def video_teardown(video, mined_desc, hook, comment_moments, comment_themes,
+                   winners, user_niche=""):
+    """LIVE (Claude). The one-call synthesis. Returns {text, cost_usd} or {error}."""
+    prompt = build_teardown_prompt(video, mined_desc, hook, comment_moments,
+                                   comment_themes, winners, user_niche)
+    try:
+        res = engine._call_claude(prompt, max_tokens=900)
+        return {"text": res["text"], "cost_usd": res["cost_usd"]}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def build_summary_prompt(video, transcript_text, mined_desc):
+    """Plain 'what was this video about' summary — distinct from the teardown (which is
+    about ideas/styles to steal). PURE."""
+    chapters = "\n".join(f"- {c['t']} {c['label']}" for c in
+                         (mined_desc or {}).get("chapters", [])[:20]) or "(none)"
+    body = (transcript_text or "")[:11000]
+    src = ("the transcript below" if body else
+           "the title, description and chapters (no transcript available)")
+    return f"""Summarise what this YouTube video is ABOUT, based on {src}. This is a plain \
+content summary — what's covered and the main points — NOT advice.
+
+TITLE: "{video.get('title')}" by {video.get('channel')}
+
+Creator chapters:
+{chapters}
+
+Transcript:
+{body if body else '(no transcript — rely on title/description/chapters)'}
+
+Respond in markdown:
+## In one line
+A single sentence: what this video is.
+## What it covers
+4-7 bullets of the actual topics/points, in order.
+## Takeaway
+1-2 sentences: the main thing a viewer walks away knowing.
+Summarise only what's present — do not invent details."""
+
+
+def summarize_video(video, transcript_text, mined_desc):
+    """LIVE (Claude). Returns {text, cost_usd} or {error}."""
+    prompt = build_summary_prompt(video, transcript_text, mined_desc)
+    try:
+        res = engine._call_claude(prompt, max_tokens=700)
+        return {"text": res["text"], "cost_usd": res["cost_usd"]}
+    except Exception as e:
+        return {"error": str(e)}
+
+
 # ----------------------------------------------------------------- AI prompts
 def build_clip_prompt(video_meta, segments):
     """Prompt to nominate Short-worthy clips from transcript content. The honesty label
@@ -336,6 +495,20 @@ def fetch_niche_peers(keyword, per_format=50, region_label="All regions"):
     ds = engine.fetch_dataset(keyword, balanced=True, videos_per_format=per_format,
                               region_label=region_label)
     return ds["videos"], ds.get("cost", 0), ds.get("from_cache", False)
+
+
+def fetch_channel_recent(channel_id, n=25):
+    """The channel's own recent uploads, enriched — for the 'is this a hit FOR THEM?'
+    comparison. LIVE. Costs ~100 (search) + a couple of units."""
+    ids = engine.search_ids("", max_results=n, order="date",
+                            region={"channelId": channel_id})
+    ids = ids[:n]
+    if not ids:
+        return []
+    vids = engine.get_videos_details(ids)
+    subs = engine.get_channel_subs([channel_id])
+    engine.enrich(vids, subs)
+    return vids
 
 
 def fetch_transcript(video_id, db_path=None):

@@ -86,7 +86,19 @@ def opportunity_score(heat, n_videos):
     return round(heat / math.sqrt(n_videos), 3)
 
 
-def _trend_stats(cluster_videos):
+def breadth_label(effective_n, top1_share, n_videos):
+    """Is this a real trend (many channels getting views) or one channel's/one video's
+    spike? Uses effective-n (independent channels) + the top channel's share."""
+    if n_videos <= 1:
+        return ("one-video", "🔴", "a single video, not a trend")
+    if effective_n >= 5 and top1_share <= 0.4:
+        return ("broad", "🟢", "many independent channels — a real trend")
+    if effective_n >= 2.5 and top1_share <= 0.6:
+        return ("mixed", "🟡", "a few channels carry it")
+    return ("one-channel", "🔴", "basically one channel — not a broad trend")
+
+
+def _trend_stats(cluster_videos, examples_n=5):
     """Per-trend numbers. Assumes each video already has _pattern_score attached by the
     pool-wide age-fair pass (so heat is age-fair)."""
     vc = engine.channel_clustering(cluster_videos)
@@ -95,14 +107,16 @@ def _trend_stats(cluster_videos):
     heat = statistics.median(v.get("_pattern_score", 0) for v in cluster_videos)
     n = len(cluster_videos)
     top1_share = (vc["top_channels"][0][1] / n) if vc.get("top_channels") and n else 0
+    breadth, breadth_icon, breadth_note = breadth_label(vc["effective_n"], top1_share, n)
     if n <= 6 and heat >= 1.3:
         stage = "emerging (few videos, fast) — opportunity"
     elif n >= 15:
         stage = "saturated (crowded)"
     else:
         stage = "developing"
-    examples = sorted(cluster_videos, key=lambda v: v.get("_pattern_score", 0),
-                      reverse=True)[:3]
+    # 'most popular videos in this trend' = top by raw views (what the user asked for)
+    examples = sorted(cluster_videos, key=lambda v: v.get("views", 0),
+                      reverse=True)[:examples_n]
     return {
         "n_videos": n,
         "median_views": int(statistics.median(views)) if views else 0,
@@ -111,17 +125,23 @@ def _trend_stats(cluster_videos):
         "channels": vc["channels"],
         "effective_n": vc["effective_n"],
         "top1_share": round(top1_share, 2),
+        "breadth": breadth,
+        "breadth_icon": breadth_icon,
+        "breadth_note": breadth_note,
         "heat": round(heat, 2),
         "opportunity": opportunity_score(heat, n),
         "stage": stage,
         "examples": [{"title": v.get("title"),
+                      "channel": v.get("channel"),
+                      "thumbnail": v.get("thumbnail"),
                       "url": v.get("url", f"https://www.youtube.com/watch?v={v.get('id','')}"),
                       "views": v.get("views"),
+                      "views_per_day": v.get("views_per_day"),
                       "score": round(v.get("_pattern_score", 0), 2)} for v in examples],
     }
 
 
-def build_trends_from_videos(videos, topic="", min_cluster=3):
+def build_trends_from_videos(videos, topic="", min_cluster=3, examples_n=5):
     """The core (pure given enriched videos). Age-fair-scores the whole pool, clusters by
     title n-grams, computes per-trend stats, and sorts by opportunity. This is Snapshot
     mode's brain — testable without any network."""
@@ -129,7 +149,7 @@ def build_trends_from_videos(videos, topic="", min_cluster=3):
     clusters, unclustered = cluster_by_ngrams(videos, topic=topic, min_cluster=min_cluster)
     trends = []
     for c in clusters:
-        stats = _trend_stats(c["videos"])
+        stats = _trend_stats(c["videos"], examples_n=examples_n)
         stats["trend"] = c["key"]
         trends.append(stats)
     trends.sort(key=lambda t: t["opportunity"], reverse=True)
@@ -184,6 +204,70 @@ def snapshot(genre, per_format=50, region_label="All regions", min_cluster=3):
     result["cost"] = ds.get("cost", 0)
     result["from_cache"] = ds.get("from_cache", False)
     return result
+
+
+# Broad areas a creator actually thinks in. Each maps to seed search terms; clustering
+# then surfaces the SPECIFIC sub-trends inside (e.g. Gaming -> a specific game).
+# Worldwide by design — no region needed for "what's popular in this area".
+BROAD_AREAS = {
+    "Gaming": ["gameplay", "gaming", "game"],
+    "Cooking": ["recipe", "cooking", "food"],
+    "Fitness": ["workout", "fitness", "gym"],
+    "Tech": ["tech review", "smartphone", "gadget"],
+    "Beauty": ["makeup", "skincare", "beauty"],
+    "Cars": ["car review", "cars"],
+    "Music": ["music video", "song cover"],
+    "Comedy": ["comedy skit", "funny"],
+    "Education": ["explained", "documentary"],
+    "Sports": ["highlights", "sports"],
+    "Travel": ["travel vlog", "travel guide"],
+    "Finance": ["investing", "personal finance"],
+    "Vlogs / Lifestyle": ["vlog", "day in my life"],
+    "DIY / Crafts": ["diy", "how to make"],
+}
+
+
+def discover_area(area, n_trends=8, recent_days=45, per_source=50, min_cluster=3,
+                  examples_n=5):
+    """The flow the user wants: pick a BROAD area, get back the SPECIFIC sub-trends that
+    are popular inside it (Gaming -> 'rocket league', a hot new game…), each with its most
+    popular videos. Worldwide. LIVE.
+
+    Pulls recent high-view videos for the area's seed terms, pools them, then reuses the
+    age-fair clustering to surface and rank sub-trends. Returns the top n_trends.
+    """
+    from datetime import datetime, timezone, timedelta
+    seeds = BROAD_AREAS.get(area, [area])
+    after = (datetime.now(timezone.utc) - timedelta(days=recent_days)).strftime("%Y-%m-%d")
+
+    ids, seen, cost = [], set(), 0
+    for seed in seeds:
+        try:
+            got = engine.search_ids(seed, max_results=per_source, order="viewCount",
+                                    after=after)
+            cost += 100
+            for vid in got:
+                if vid not in seen:
+                    seen.add(vid)
+                    ids.append(vid)
+        except Exception:
+            continue
+    if not ids:
+        return {"area": area, "n_videos": 0, "n_trends": 0, "trends": [],
+                "cost": cost, "note": "No videos returned for this area."}
+
+    vids = engine.get_videos_details(ids)
+    engine.enrich(vids)
+    built = build_trends_from_videos(vids, topic=area, min_cluster=min_cluster,
+                                     examples_n=examples_n)
+    built["area"] = area
+    built["trends"] = built["trends"][:n_trends]
+    built["n_trends"] = len(built["trends"])
+    built["cost"] = cost + max(1, len(ids) // 50)
+    built["note"] = (f"Specific trends inside '{area}', worldwide, from videos published "
+                     f"in the last {recent_days} days. Ranked by opportunity "
+                     f"(age-fair heat ÷ saturation).")
+    return built
 
 
 # YouTube's broad video categories (mostPopular chart). Coarse but real (§4a).

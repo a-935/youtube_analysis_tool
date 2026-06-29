@@ -241,6 +241,51 @@ def test_video_pure():
     ok("paste: plain text usable by risk/clips", "welcome" in p3["text"])
     ok("paste: empty -> empty", vt.parse_pasted_transcript("")["segments"] == [])
 
+    # vs-channel placement (the meaningful comparison)
+    ch_vids = [make_video(f"cv{i}", f"my video {i}", "me", 5000 * (i + 1), 10 + i, dur=300)
+               for i in range(12)]
+    target2 = make_video("BIG", "my breakout", "me", 400000, 11, dur=300)
+    vc = vt.place_vs_channel(target2, ch_vids)
+    ok("vs-channel multiplier computed", vc and vc["vs_channel_typical"] > 1,
+       f"{vc['vs_channel_typical']}×")
+    ok("vs-channel reports n", vc["n_channel_videos"] == 12)
+    ok("vs-channel empty -> None", vt.place_vs_channel(target2, []) is None)
+
+    # comment-moment mining (audience-flagged timestamps)
+    comments = ["19:35 was gold lol", "loved the bit at 19:35", "1:48 so true",
+                "no timestamps here", "the 19:35 moment again"]
+    moments = vt.mine_comment_moments(comments)
+    ok("comment moments found + ranked", moments and moments[0]["t"] == "19:35"
+       and moments[0]["mentions"] == 3, str(moments[:1]))
+    ok("comment moments compute seconds", moments[0]["seconds"] == 19 * 60 + 35)
+    ok("comment moments empty-safe", vt.mine_comment_moments([]) == [])
+
+    # title analysis
+    winners3 = [{"title": "a b c d e"}, {"title": "a b c d e f g"}]
+    tinfo = vt.analyze_title({"title": "INSANE 5 things you missed?"}, winners3)
+    ok("title flags number/question/caps", tinfo["has_number"] and tinfo["is_question"]
+       and tinfo["has_allcaps_word"])
+    ok("title vs winners", tinfo["winners_median_words"] == 6 and
+       tinfo["vs_winners"] in ("shorter than", "longer than", "same length as"))
+
+    # teardown prompt
+    tp = vt.build_teardown_prompt({"title": "X", "channel": "c", "views": 100,
+                                   "views_per_day": 50, "age_days": 2},
+                                  {"chapters": [{"t": "0:00", "label": "Intro"}]},
+                                  "the hook", moments, "themes here", winners3,
+                                  user_niche="rocket league")
+    ok("teardown prompt tailors to niche", "rocket league" in tp.lower()
+       and "steal this" in tp.lower())
+
+    # video summary prompt (distinct from teardown)
+    sp = vt.build_summary_prompt({"title": "How GPUs work", "channel": "c"},
+                                 "today we explain how a gpu renders frames",
+                                 {"chapters": [{"t": "0:00", "label": "Intro"}]})
+    ok("summary prompt is content not advice",
+       "what it covers" in sp.lower() and "not advice" in sp.lower())
+    sp2 = vt.build_summary_prompt({"title": "X", "channel": "c"}, "", {})
+    ok("summary prompt handles no transcript", "no transcript" in sp2.lower())
+
 
 # ---------------------------------------------------------------- trends (pure)
 def test_trends():
@@ -276,6 +321,22 @@ def test_trends():
 
     ok("opportunity rewards low saturation",
        tt.opportunity_score(2.0, 4) > tt.opportunity_score(2.0, 16))
+
+    # examples are now the MOST POPULAR videos (by views), as the user asked
+    top_ex = snap["trends"][0]["examples"]
+    if len(top_ex) >= 2:
+        ok("trend examples sorted by views (most popular first)",
+           top_ex[0]["views"] >= top_ex[1]["views"])
+    ok("broad areas defined", "Gaming" in tt.BROAD_AREAS and "Cooking" in tt.BROAD_AREAS)
+    ok("unknown area falls back to itself as seed",
+       tt.BROAD_AREAS.get("Nonexistent", ["Nonexistent"]) == ["Nonexistent"])
+
+    # breadth: many channels = broad; one channel = not a trend
+    ok("breadth broad", tt.breadth_label(8, 0.2, 20)[0] == "broad")
+    ok("breadth one-channel", tt.breadth_label(1.1, 0.9, 12)[0] == "one-channel")
+    ok("breadth one-video", tt.breadth_label(1.0, 1.0, 1)[0] == "one-video")
+    ok("breadth label on trends", "breadth" in snap["trends"][0] and
+       "breadth_icon" in snap["trends"][0])
 
     # diff: heat rises on one trend -> accelerating; one disappears -> gone
     old = {"ts": "t0", "trends": [{"trend": "1v1 ranked", "heat": 1.0, "n_videos": 6},
